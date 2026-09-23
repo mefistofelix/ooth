@@ -489,35 +489,62 @@ func OpenListener(network, address string) (*Listener, error) {
 	return result, nil
 }
 
-// Wait blocks in Go's network poller without consuming a connection.
-// It requires the zero-length-read patch installed by build.sh.
-func (listener *Listener) Wait() error {
-	_, err := listener.File.Read(nil)
-	return err
-}
-
 func (listener *Listener) ChildFile() (*os.File, error) {
 	return listener.Listener.(interface{ File() (*os.File, error) }).File()
-}
-
-func CheckRuntime() error {
-	listener, err := OpenListener("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	if err := listener.File.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
-		return err
-	}
-	if err := listener.Wait(); !errors.Is(err, os.ErrDeadlineExceeded) {
-		return fmt.Errorf("Go readiness patch missing: build ooth using ./build.sh (read returned %v)", err)
-	}
-	return nil
 }
 
 func (listener *Listener) Close() error {
 	listener.File.Close()
 	return listener.Listener.Close()
+}
+
+// One epoll instance observes all listeners. The loopback datagram wakes the
+// blocking Wait during shutdown on both platforms; it carries no worker data.
+type Poller struct {
+	fd    int
+	wake  net.PacketConn
+	waker net.Conn
+}
+
+func NewPoller() (*Poller, error) {
+	fd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	wake, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		syscall.EpollClose(fd)
+		return nil, err
+	}
+	waker, err := net.Dial("udp4", wake.LocalAddr().String())
+	if err != nil {
+		wake.Close()
+		syscall.EpollClose(fd)
+		return nil, err
+	}
+	poller := &Poller{fd: fd, wake: wake, waker: waker}
+	raw, err := wake.(syscall.Conn).SyscallConn()
+	if err == nil {
+		var controlErr error
+		err = raw.Control(func(socket uintptr) {
+			controlErr = syscall.EpollCtl(fd, syscall.EPOLL_CTL_ADD, int(socket), &syscall.EpollEvent{Events: syscall.EPOLLIN | syscall.EPOLLONESHOT})
+		})
+		if err == nil {
+			err = controlErr
+		}
+	}
+	if err != nil {
+		poller.Close()
+		return nil, err
+	}
+	return poller, nil
+}
+
+func (poller *Poller) Close() error {
+	err := syscall.EpollClose(poller.fd)
+	poller.waker.Close()
+	poller.wake.Close()
+	return err
 }
 
 type process struct {
@@ -536,13 +563,14 @@ type process struct {
 }
 
 type message struct {
-	process  *process
-	listener *serviceListener
-	event    Event
-	exited   bool
-	probe    bool
-	ready    bool
-	err      error
+	process *process
+	sockets []syscall.EpollEvent
+	poll    bool
+	event   Event
+	exited  bool
+	probe   bool
+	ready   bool
+	err     error
 }
 
 func (manager *manager) spawn(service *service, now time.Time) error {
@@ -630,12 +658,21 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 
 type serviceListener struct {
 	*Listener
-	stop chan struct{}
+	poller  int
+	socket  int
+	id      int32
+	rearmAt time.Time
 }
 
-func (listener *serviceListener) close() {
-	close(listener.stop)
+func (listener *serviceListener) close() error {
+	err := syscall.EpollCtl(listener.poller, syscall.EPOLL_CTL_DEL, listener.socket, nil)
 	listener.Close()
+	return err
+}
+
+func (listener *serviceListener) arm(operation int) error {
+	return syscall.EpollCtl(listener.poller, operation, listener.socket,
+		&syscall.EpollEvent{Events: syscall.EPOLLIN | syscall.EPOLLONESHOT, Fd: listener.id})
 }
 
 type service struct {
@@ -652,30 +689,42 @@ type service struct {
 }
 
 type manager struct {
-	services map[string]*service
-	workers  map[*process]struct{}
-	messages chan message
-	log      *slog.Logger
-	done     chan struct{}
-	fatal    error
+	services     map[string]*service
+	workers      map[*process]struct{}
+	messages     chan message
+	log          *slog.Logger
+	done         chan struct{}
+	fatal        error
+	poller       *Poller
+	listeners    map[int32]*service
+	nextListener int32
 }
 
 func Run(ctx context.Context, path string, logger *slog.Logger) error {
-	if err := CheckRuntime(); err != nil {
-		return err
-	}
 	initial, err := Load(path)
 	if err != nil {
 		return err
 	}
+	poller, err := NewPoller()
+	if err != nil {
+		return fmt.Errorf("create listener poller: %w", err)
+	}
+	defer poller.Close()
 	manager := &manager{
 		services: make(map[string]*service), workers: make(map[*process]struct{}),
 		messages: make(chan message, 256), log: logger, done: make(chan struct{}),
+		poller: poller, listeners: make(map[int32]*service),
 	}
-	defer close(manager.done)
 	if err := manager.apply(initial); err != nil {
 		return err
 	}
+	pollDone := make(chan struct{})
+	go func() { defer close(pollDone); manager.watchListeners() }()
+	defer func() {
+		close(manager.done)
+		poller.waker.Write([]byte{1})
+		<-pollDone
+	}()
 	watchContext, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
 	updates := make(chan Snapshot)
@@ -690,6 +739,12 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	var retryConfig time.Time
 	var lastReap time.Time
 	for {
+		if manager.fatal != nil && !stopping {
+			result = manager.fatal
+			stopping = true
+			cancelWatch()
+			manager.shutdown()
+		}
 		if stopping && len(manager.workers) == 0 {
 			return result
 		}
@@ -720,12 +775,6 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 			}
 		case msg := <-manager.messages:
 			manager.handle(msg, time.Now())
-			if manager.fatal != nil && !stopping {
-				result = manager.fatal
-				stopping = true
-				cancelWatch()
-				manager.shutdown()
-			}
 		case now := <-ticker.C:
 			if runtime.GOOS == "linux" && os.Getpid() == 1 && now.Sub(lastReap) >= time.Second {
 				manager.reapOrphans()
@@ -782,6 +831,14 @@ func (manager *manager) reapOrphans() {
 
 func (manager *manager) apply(snapshot Snapshot) error {
 	opened := make(map[string]*serviceListener)
+	committed := false
+	defer func() {
+		if !committed {
+			for _, listener := range opened {
+				listener.close()
+			}
+		}
+	}()
 	for name, app := range snapshot.Apps {
 		if app.Listen.Network == "" {
 			continue
@@ -792,12 +849,20 @@ func (manager *manager) apply(snapshot Snapshot) error {
 		}
 		listener, err := OpenListener(app.Listen.Network, app.Listen.Address)
 		if err != nil {
-			for _, staged := range opened {
-				staged.close()
-			}
 			return fmt.Errorf("%s: %w", name, err)
 		}
-		opened[name] = &serviceListener{Listener: listener, stop: make(chan struct{})}
+		if manager.nextListener == 1<<31-1 {
+			listener.Close()
+			return fmt.Errorf("listener identifiers exhausted")
+		}
+		manager.nextListener++
+		staged := &serviceListener{Listener: listener, poller: manager.poller.fd,
+			socket: int(listener.File.Fd()), id: manager.nextListener}
+		if err := staged.arm(syscall.EPOLL_CTL_ADD); err != nil {
+			listener.Close()
+			return fmt.Errorf("%s: register listener: %w", name, err)
+		}
+		opened[name] = staged
 	}
 	for name, previous := range manager.services {
 		next, exists := snapshot.Apps[name]
@@ -809,7 +874,7 @@ func (manager *manager) apply(snapshot Snapshot) error {
 		}
 		if !exists || previous.config.Listen != next.Listen {
 			if previous.listener != nil {
-				previous.listener.close()
+				manager.closeListener(previous.listener)
 			}
 			delete(manager.services, name)
 		}
@@ -832,39 +897,52 @@ func (manager *manager) apply(snapshot Snapshot) error {
 			}
 		}
 		manager.services[name] = current
-		if opened[name] != nil {
-			go manager.watchListener(listener)
+		if listener != nil {
+			manager.listeners[listener.id] = current
 		}
 		manager.log.Info("service configured", "app", name, "network", app.Listen.Network, "address", app.Listen.Address)
 	}
+	committed = true
 	return nil
 }
 
-func (manager *manager) watchListener(listener *serviceListener) {
+func (manager *manager) watchListeners() {
+	events := make([]syscall.EpollEvent, 64)
 	for {
-		err := listener.Wait()
+		count, err := syscall.EpollWait(manager.poller.fd, events, -1)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			count = 0 // Linux returns -1 on failure.
+		}
+		for _, event := range events[:count] {
+			if event.Fd == 0 {
+				return
+			}
+		}
 		select {
-		case <-listener.stop:
+		case <-manager.done:
 			return
-		case manager.messages <- message{listener: listener, err: err}:
+		case manager.messages <- message{poll: true, sockets: slices.Clone(events[:count]), err: err}:
 		}
 		if err != nil {
 			return
 		}
-		// Windows readiness is level-triggered. Bound notification frequency
-		// while a connection waits for a starting or saturated worker.
-		select {
-		case <-listener.stop:
-			return
-		case <-time.After(25 * time.Millisecond):
-		}
+	}
+}
+
+func (manager *manager) closeListener(listener *serviceListener) {
+	delete(manager.listeners, listener.id)
+	if err := listener.close(); err != nil {
+		manager.log.Error("unregister listener", "error", err)
 	}
 }
 
 func (manager *manager) shutdown() {
 	for _, service := range manager.services {
 		if service.listener != nil {
-			service.listener.close()
+			manager.closeListener(service.listener)
 			service.listener = nil
 		}
 	}
@@ -883,15 +961,22 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 }
 
 func (manager *manager) handle(msg message, now time.Time) {
-	if msg.listener != nil {
-		for _, service := range manager.services {
-			if service.listener == msg.listener {
-				if msg.err != nil {
-					manager.fatal = fmt.Errorf("%s: listener wait failed: %w", service.name, msg.err)
-				} else {
-					service.demand = true
-				}
+	if msg.poll {
+		if msg.err != nil {
+			manager.fatal = fmt.Errorf("listener poller: %w", msg.err)
+			return
+		}
+		for _, event := range msg.sockets {
+			service := manager.listeners[event.Fd]
+			if service == nil {
+				continue // A queued event can outlive a configuration.
 			}
+			if event.Events&(syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
+				manager.fatal = fmt.Errorf("%s: listener event %#x", service.name, event.Events)
+				continue
+			}
+			service.demand = true
+			service.listener.rearmAt = now.Add(25 * time.Millisecond)
 		}
 		return
 	}
@@ -967,6 +1052,17 @@ func (service *service) backoff(now time.Time) {
 }
 
 func (manager *manager) tick(now time.Time, stopping bool) {
+	if !stopping {
+		for _, service := range manager.listeners {
+			listener := service.listener
+			if !listener.rearmAt.IsZero() && !now.Before(listener.rearmAt) {
+				if err := listener.arm(syscall.EPOLL_CTL_MOD); err != nil {
+					manager.fatal = fmt.Errorf("%s: rearm listener: %w", service.name, err)
+				}
+				listener.rearmAt = time.Time{}
+			}
+		}
+	}
 	for child := range manager.workers {
 		app := child.config
 		if !child.stopping.IsZero() {

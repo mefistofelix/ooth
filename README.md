@@ -17,7 +17,7 @@ curl http://127.0.0.1:8080/
 
 On Windows use Git Bash to build, then run `bin/ooth-windows-amd64.exe`. Set the example's `command` to the absolute path of your Python interpreter if `python3` is not available. Production workers may use any language; Python is only an example.
 
-The script downloads and verifies **Go 1.27.1**, patches its dedicated copy under `build/`, runs tests and `go vet`, then builds amd64 and arm64 binaries for the host OS. It never patches an existing Go installation. The Go version is deliberately pinned: these small internal changes must be reviewed when upgrading Go. A stock `go build` is not supported.
+The script downloads and verifies **Go 1.27.1**, patches its dedicated copy under `build/`, runs tests and `go vet`, then builds amd64 and arm64 binaries for the host OS. It never patches an existing Go installation. When the patch changes, affected source files are restored from the verified archive before applying it. The Go version is deliberately pinned: toolchain changes must be reviewed when upgrading Go. A stock `go build` is not supported.
 
 `-version` prints the commit/build version; `-debug` includes completed request metrics. The GitHub workflow tests on Linux and Windows on push. Run the workflow manually to publish a prerelease containing the four binaries and `SHA256SUMS`; arm64 is cross-compiled, while integration tests run on amd64.
 
@@ -98,20 +98,33 @@ The environment contains `OOTH_WORKER=1` and `OOTH_CONCURRENCY`. Configuration c
 
 ## Platform details
 
-Linux uses the original zero-length-read idea: the dedicated Go patch makes `File.Read(nil)` wait through Go's existing network poller without resetting the pending readiness edge. ooth does not implement its own epoll loop. It sends `SIGTERM`, then `Process.Kill` (`SIGKILL`) after `stop_timeout`.
+Both platforms use `syscall.EpollCreate1`, `EpollCtl` and `EpollWait`. One goroutine waits for **all listeners**; there is no goroutine or periodic readiness check per listener. ooth registers `EPOLLIN | EPOLLONESHOT`, then rearms delivered listeners through the supervisor's existing 25 ms tick. This bounds notifications while a connection waits for a starting worker. Unique registration IDs discard events from removed configurations. A private loopback UDP socket wakes the poller during shutdown; it is not a worker control channel.
+
+Linux uses the existing kernel epoll implementation. The old `Read(nil)` change is gone; the only syscall addition on Linux is `EpollClose(int)`, a portable close spelling shared with the Windows extension. Shutdown sends `SIGTERM`, then `Process.Kill` (`SIGKILL`) after `stop_timeout`.
 
 Windows needs more than that Unix patch. A connected socket's zero-byte `WSARecv` already waits for data, but a listening socket does not provide that operation. [Issue 15735](https://github.com/golang/go/issues/15735) and the tests in [CL 22031](https://go-review.googlesource.com/c/go/+/22031) concern connections after `Accept`; the comment quoted in [issue 27315](https://github.com/golang/go/issues/27315) points to that proposal. Local tests on stock Go 1.24.3 and 1.27.1 reproduced this distinction.
 
 The Windows toolchain patch:
 
-- Waits for listener readiness with `WSAPoll`, without accepting anything. It checks deadline/close state every 20 ms; this uses an OS wait thread per active wait and is a known scaling cost.
-- Inherits the Winsock handle directly. Shared listeners use local completion events instead of binding the shared socket to one process's IOCP. Connected sockets retain Go's normal I/O implementation.
+- Adds the epoll socket API using asynchronous `IOCTL_AFD_POLL` requests and one IOCP per poller. A separate AFD device handle owns the IOCP association; monitored sockets are not attached to it. Requests remain pinned until their completion packets are drained, including cancellation and close. No Rust, C, CGO, libuv or wepoll binary dependency is needed.
+- Uses the standard `exec.Cmd.Stdin` inheritance path. The former `StartProcess` override was removed after TCP and Unix lifecycle tests passed without it. Shared Go listeners still need local completion events instead of binding the shared socket to one process's IOCP: removing that adaptation makes `net.FileListener` fail in the worker. Connected sockets retain Go's normal I/O implementation. The inherited `AcceptEx` fallback still checks deadline/close every 20 ms; that worker-side wait is separate from the supervisor's event-driven AFD poller.
 - Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. Visible GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
 - Uses `Process.Kill` after the configured timeout. No `taskkill`, PowerShell, or shell command is launched by ooth.
 
 Workers must handle the graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Windows SCM service control is not implemented. Process termination targets the direct worker; descendants must be managed by the worker rather than daemonized independently.
 
 Go workers that share a Windows listener must use this patched toolchain too, including when converting stdin with `net.FileListener`. Other languages need their native inherited-socket support. This compatibility requirement is why the Windows patch is more substantial than the Linux patch.
+
+### Reusable epoll extension
+
+The implementation is in [`tools/patchgo/patches/epoll_windows.txt`](tools/patchgo/patches/epoll_windows.txt), installed as `syscall/ooth_epoll_windows.go`. Its API has no knowledge of workers, configuration or ooth. The AFD mechanism follows the approach demonstrated by [wepoll](https://github.com/piscisaureus/wepoll) and [libuv](https://github.com/libuv/libuv/blob/v1.x/src/win/poll.c); attribution is included in `THIRD_PARTY_NOTICES.md`.
+
+- Supports `EpollCreate`, `EpollCreate1`, `EpollCtl`, `EpollWait` and `EpollClose` on Windows amd64/arm64, for native Winsock sockets including TCP, UDP and Unix sockets.
+- Supports ADD/MOD/DEL, level triggering and `EPOLLONESHOT`; events include IN, OUT, PRI, ERR, HUP and RDHUP. Unsupported flags, including `EPOLLET`, are rejected. This is a documented subset, not complete Linux epoll compatibility.
+- Each underlying socket has one owning AFD poller. DEL before closing or reusing its handle, including duplicated/inherited handles. One caller performs Wait; control operations may run concurrently. Fd/Pad in `EpollEvent` are opaque application data, not the socket handle; pass the full-width handle as the `EpollCtl` fd argument.
+- Use `EpollClose`, not Windows `CloseHandle`, to cancel and drain pending requests safely. AFD structures use an internal Windows interface. The backend is experimental and tested on the supported build matrix; other providers and Windows versions need validation.
+
+`epoll_test.go` exercises readiness without consuming traffic, one-shot rearming, level triggering, pending MOD/DEL/re-add, shutdown cancellation, connection writability/half-close and 128 idle listeners without per-socket goroutine growth. Run `go test -run '^$' -bench BenchmarkEpollIdleListeners -benchmem .` with the dedicated compiler for an idle-queue microbenchmark; it is not an application-throughput comparison.
 
 ## Development status
 

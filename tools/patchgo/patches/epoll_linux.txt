@@ -1,0 +1,5 @@
+package syscall
+
+// EpollClose closes an epoll instance. This portable spelling also exists in
+// the ooth Windows extension, where socket and kernel handles differ from fds.
+func EpollClose(epfd int) error { return Close(epfd) }

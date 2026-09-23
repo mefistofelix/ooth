@@ -23,13 +23,23 @@ archive="go1.27.1.$host_os-$host_arch.$extension"
 directory="$PWD/build/$host_os-$host_arch"
 mkdir -p "$directory" bin
 printf 'module ooth-build-cache\n\ngo 1.27.0\n' > build/go.mod
-if [[ ! -f "$directory/.extracted" ]]; then
+if [[ ! -f "$directory/$archive" ]]; then
   curl --fail --location --retry 3 "https://go.dev/dl/$archive" -o "$directory/$archive"
+fi
+# Re-extract when the patch changes so removed edits cannot survive an upgrade.
+patch_hash=$(cat tools/patchgo/main.go tools/patchgo/patches/*.txt | sha256sum | cut -d ' ' -f 1)
+if [[ ! -f "$directory/.patch-version" || $(cat "$directory/.patch-version") != "$patch_hash" ]]; then
   printf '%s  %s\n' "$checksum" "$directory/$archive" | sha256sum --check
+  restore=()
+  if [[ -f "$directory/.extracted" ]]; then
+    restore=(go/src/internal/poll/fd_unix.go go/src/internal/poll/fd_windows.go
+      go/src/runtime/netpoll_windows.go go/src/os/exec/exec.go
+      go/src/os/exec_windows.go go/src/syscall/exec_windows.go)
+  fi
   if [[ $extension == zip ]]; then
-    unzip -oq "$directory/$archive" -d "$directory"
+    unzip -oq "$directory/$archive" "${restore[@]}" -d "$directory"
   else
-    tar -xzf "$directory/$archive" -C "$directory"
+    tar -xzf "$directory/$archive" -C "$directory" "${restore[@]}"
   fi
   touch "$directory/.extracted"
 fi
@@ -39,6 +49,7 @@ export CGO_ENABLED=0 GOTOOLCHAIN=local
 unset GOOS GOARCH
 compiler="$directory/go/bin/go"
 "$compiler" run ./tools/patchgo -goroot "$GOROOT"
+printf '%s\n' "$patch_hash" > "$directory/.patch-version"
 "$compiler" mod verify
 "$compiler" test -timeout 60s ./...
 "$compiler" vet ./...

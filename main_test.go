@@ -132,9 +132,6 @@ func TestWorkerHelper(t *testing.T) {
 }
 
 func TestActivationLifecycle(t *testing.T) {
-	if err := CheckRuntime(); err != nil {
-		t.Fatal(err)
-	}
 	for _, network := range []string{"tcp", "unix"} {
 		t.Run(network, func(t *testing.T) {
 			directory := t.TempDir()

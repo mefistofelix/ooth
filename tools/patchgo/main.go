@@ -26,28 +26,9 @@ func main() {
 	if strings.Split(string(version), "\n")[0] != "go1.27.1" {
 		fail(fmt.Errorf("patch requires Go 1.27.1"))
 	}
-	replace(*root, "src/internal/poll/fd_unix.go",
-		"\t\treturn 0, nil\n\t}\n\tif err := fd.pd.prepareRead(fd.isFile)",
-		`		// ooth: retain the pending edge; do not reset it with prepareRead.
-		return 0, fd.pd.waitRead(fd.isFile)
-	}
-	if err := fd.pd.prepareRead(fd.isFile)`)
-	replace(*root, "src/internal/poll/fd_windows.go",
-		"\tif len(buf) > maxRW {\n\t\tbuf = buf[:maxRW]\n\t}\n\n\tvar n int",
-		`	// ooth: listener readiness without accepting a connection.
-	if len(buf) == 0 && fd.sharedListener {
-		return 0, fd.waitSocketReadable()
-	}
-	if len(buf) > maxRW {
-		buf = buf[:maxRW]
-	}
-
-	var n int`)
-	replace(*root, "src/internal/poll/fd_windows.go", "\twaitOnSuccess bool\n", "\twaitOnSuccess bool\n\tsharedListener bool // ooth: no process owns the shared socket's IOCP\n")
 	replace(*root, "src/internal/poll/fd_windows.go", "\terr := fd.pd.init(fd)\n", `	// ooth: shared listening sockets must not belong to one process's IOCP.
 	if listening, _ := syscall.GetsockoptInt(fd.Sysfd, syscall.SOL_SOCKET, 2); fd.kind == kindNet && listening != 0 {
 		serverInit.Do(runtime_pollServerInit)
-		fd.sharedListener = true
 		ctx, errno := runtime_pollOpen(uintptr(syscall.InvalidHandle))
 		if errno != 0 { return syscall.Errno(errno) }
 		fd.pd.runtimeCtx = ctx
@@ -78,22 +59,13 @@ func main() {
 		return signalConsoleGroup(p.Pid)
 	}
 	if sig == Kill {`)
-	replace(*root, "src/syscall/exec_windows.go", "\t\tif attr.Files[i] > 0 {\n\t\t\terr := DuplicateHandle",
-		`		if attr.Files[i] > 0 {
-			// ooth: inherit Winsock handles directly; DuplicateHandle loses socket context.
-			if _, socketErr := GetsockoptInt(Handle(attr.Files[i]), SOL_SOCKET, 0x1008); socketErr == nil {
-				if parentProcess != p { return 0, 0, EWINDOWS }
-				fd[i] = Handle(attr.Files[i])
-				if err := SetHandleInformation(fd[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT); err != nil { return 0, 0, err }
-				defer SetHandleInformation(fd[i], HANDLE_FLAG_INHERIT, 0)
-				continue
-			}
-			err := DuplicateHandle`)
 	for template, target := range map[string]string{
-		"poll_windows.txt": "src/internal/poll/ooth_windows.go",
-		"exec_windows.txt": "src/os/exec/ooth_windows.go",
-		"exec_other.txt":   "src/os/exec/ooth_other.go",
-		"os_windows.txt":   "src/os/ooth_windows.go",
+		"epoll_linux.txt":   "src/syscall/ooth_epoll_linux.go",
+		"epoll_windows.txt": "src/syscall/ooth_epoll_windows.go",
+		"poll_windows.txt":  "src/internal/poll/ooth_windows.go",
+		"exec_windows.txt":  "src/os/exec/ooth_windows.go",
+		"exec_other.txt":    "src/os/exec/ooth_other.go",
+		"os_windows.txt":    "src/os/ooth_windows.go",
 	} {
 		data, err := patches.ReadFile("patches/" + template)
 		if err != nil {

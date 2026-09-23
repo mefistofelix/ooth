@@ -1,0 +1,417 @@
+//go:build windows && (amd64 || arm64)
+
+// AFD protocol and event mapping follow wepoll by Bert Belder.
+// See THIRD_PARTY_NOTICES.md in the ooth source distribution for its license.
+
+package syscall
+
+import (
+	"runtime"
+	"sync"
+	"unsafe"
+)
+
+// Socket-only epoll extension supplied by the ooth toolchain. Registrations
+// have one owning poller; callers must DEL before closing/reusing a socket.
+// Level triggering and ONESHOT are supported. Edge triggering is not.
+const (
+	EPOLLIN       = 0x001
+	EPOLLPRI      = 0x002
+	EPOLLOUT      = 0x004
+	EPOLLERR      = 0x008
+	EPOLLHUP      = 0x010
+	EPOLLRDHUP    = 0x2000
+	EPOLLONESHOT  = 1 << 30
+	EPOLLET       = 1 << 31
+	EPOLL_CLOEXEC = 0x80000
+	EPOLL_CTL_ADD = 1
+	EPOLL_CTL_DEL = 2
+	EPOLL_CTL_MOD = 3
+)
+
+// Fd and Pad together are opaque caller data, not a Windows SOCKET. Pass the
+// full-width socket handle as EpollCtl's fd argument.
+type EpollEvent struct {
+	Events uint32
+	Fd     int32
+	Pad    int32
+}
+
+var epollNT = NewLazyDLL("ntdll.dll")
+var epollCreateFile = epollNT.NewProc("NtCreateFile")
+var epollDeviceControl = epollNT.NewProc("NtDeviceIoControlFile")
+var epollCancelIO = epollNT.NewProc("NtCancelIoFileEx")
+var epollStatusError = epollNT.NewProc("RtlNtStatusToDosError")
+var epollClock = NewLazyDLL("kernel32.dll").NewProc("GetTickCount64")
+
+type epollInfo struct {
+	Timeout   int64
+	Count     uint32
+	Exclusive uint32
+	Socket    Handle
+	Events    uint32
+	Status    int32
+}
+
+type epollRequest struct {
+	io           Overlapped // Its first two fields are an IO_STATUS_BLOCK.
+	info         epollInfo
+	pin          runtime.Pinner
+	registration *epollRegistration
+	generation   uint64
+}
+
+type epollRegistration struct {
+	socket     Handle
+	event      EpollEvent
+	generation uint64
+	enabled    bool
+	pending    *epollRequest
+}
+
+type epollPort struct {
+	mu      sync.Mutex
+	waitMu  sync.Mutex
+	port    Handle
+	afd     Handle
+	closed  bool
+	sockets map[int]*epollRegistration
+	pending map[*Overlapped]*epollRequest
+	rearm   []*epollRegistration
+}
+
+var epollPorts sync.Map // int -> *epollPort
+
+func epollError(status uintptr) error {
+	code, _, _ := epollStatusError.Call(status)
+	return Errno(code)
+}
+
+func EpollCreate(size int) (int, error) {
+	if size <= 0 {
+		return -1, EINVAL
+	}
+	return EpollCreate1(0)
+}
+
+// EpollCreate1 creates a non-inheritable IOCP and a separate AFD device handle.
+// Polling never associates the application socket with this IOCP.
+func EpollCreate1(flags int) (int, error) {
+	if flags & ^EPOLL_CLOEXEC != 0 {
+		return -1, EINVAL
+	}
+	port, err := createIoCompletionPort(InvalidHandle, 0, 0, 1)
+	if err != nil {
+		return -1, err
+	}
+	name, _ := UTF16FromString(`\Device\Afd\Ooth`)
+	unicode := struct {
+		Length        uint16
+		MaximumLength uint16
+		Buffer        *uint16
+	}{uint16((len(name) - 1) * 2), uint16(len(name) * 2), &name[0]}
+	attributes := struct {
+		Length                   uint32
+		Root                     Handle
+		Name                     unsafe.Pointer
+		Attributes               uint32
+		SecurityDescriptor       uintptr
+		SecurityQualityOfService uintptr
+	}{Name: unsafe.Pointer(&unicode)}
+	attributes.Length = uint32(unsafe.Sizeof(attributes))
+	var afd Handle
+	var statusBlock Overlapped
+	status, _, _ := epollCreateFile.Call(uintptr(unsafe.Pointer(&afd)), SYNCHRONIZE,
+		uintptr(unsafe.Pointer(&attributes)), uintptr(unsafe.Pointer(&statusBlock)),
+		0, 0, FILE_SHARE_READ|FILE_SHARE_WRITE, 1, 0, 0, 0)
+	runtime.KeepAlive(name)
+	if status != 0 {
+		CloseHandle(port)
+		return -1, epollError(status)
+	}
+	if _, err := createIoCompletionPort(afd, port, 0, 0); err != nil {
+		CloseHandle(afd)
+		CloseHandle(port)
+		return -1, err
+	}
+	poller := &epollPort{port: port, afd: afd,
+		sockets: make(map[int]*epollRegistration), pending: make(map[*Overlapped]*epollRequest)}
+	epollPorts.Store(int(port), poller)
+	return int(port), nil
+}
+
+func (poller *epollPort) submit(registration *epollRegistration) error {
+	mask := uint32(0x20 | 0x10 | 0x100) // local close, abort, connect failure
+	if registration.event.Events&EPOLLIN != 0 {
+		mask |= 0x01 | 0x80 | 0x08
+	}
+	if registration.event.Events&EPOLLPRI != 0 {
+		mask |= 0x02
+	}
+	if registration.event.Events&EPOLLOUT != 0 {
+		mask |= 0x04
+	}
+	if registration.event.Events&EPOLLRDHUP != 0 {
+		mask |= 0x08
+	}
+	request := &epollRequest{registration: registration, generation: registration.generation,
+		info: epollInfo{Timeout: 1<<63 - 1, Count: 1, Socket: registration.socket, Events: mask}}
+	request.io.Internal = 0x103 // STATUS_PENDING
+	request.pin.Pin(request)
+	status, _, _ := epollDeviceControl.Call(uintptr(poller.afd), 0, 0,
+		uintptr(unsafe.Pointer(&request.io)), uintptr(unsafe.Pointer(&request.io)), 0x12024,
+		uintptr(unsafe.Pointer(&request.info)), unsafe.Sizeof(request.info),
+		uintptr(unsafe.Pointer(&request.info)), unsafe.Sizeof(request.info))
+	if status != 0 && status != 0x103 {
+		request.pin.Unpin()
+		return epollError(status)
+	}
+	registration.pending = request
+	poller.pending[&request.io] = request
+	return nil
+}
+
+func (poller *epollPort) cancel(registration *epollRegistration) error {
+	if registration.pending == nil {
+		return nil
+	}
+	var result Overlapped
+	status, _, _ := epollCancelIO.Call(uintptr(poller.afd),
+		uintptr(unsafe.Pointer(&registration.pending.io)), uintptr(unsafe.Pointer(&result)))
+	if status != 0 && uint32(status) != 0xc0000225 { // STATUS_NOT_FOUND: already completed
+		return epollError(status)
+	}
+	return nil
+}
+
+func EpollCtl(epfd, op, fd int, event *EpollEvent) error {
+	value, ok := epollPorts.Load(epfd)
+	if !ok {
+		return EBADF
+	}
+	poller := value.(*epollPort)
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed {
+		return EBADF
+	}
+	if op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL {
+		return EINVAL
+	}
+	if op != EPOLL_CTL_DEL && (event == nil || event.Events & ^uint32(EPOLLIN|EPOLLPRI|EPOLLOUT|EPOLLERR|EPOLLHUP|EPOLLRDHUP|EPOLLONESHOT) != 0) {
+		return EINVAL
+	}
+	registration := poller.sockets[fd]
+	if op == EPOLL_CTL_ADD {
+		if registration != nil {
+			return EEXIST
+		}
+		if _, err := GetsockoptInt(Handle(fd), SOL_SOCKET, 0x1008); err != nil {
+			return err
+		}
+		registration = &epollRegistration{socket: Handle(fd), event: *event, enabled: true}
+		if err := poller.submit(registration); err != nil {
+			return err
+		}
+		poller.sockets[fd] = registration
+		return nil
+	}
+	if registration == nil {
+		return ENOENT
+	}
+	if err := poller.cancel(registration); err != nil {
+		return err
+	}
+	registration.generation++
+	if op == EPOLL_CTL_DEL {
+		delete(poller.sockets, fd)
+		registration.enabled = false
+		return nil
+	}
+	registration.event = *event
+	registration.enabled = true
+	if registration.pending == nil {
+		return poller.submit(registration)
+	}
+	return nil
+}
+
+func (poller *epollPort) complete(overlapped *Overlapped) (EpollEvent, bool, error) {
+	request := poller.pending[overlapped]
+	if request == nil {
+		return EpollEvent{}, false, nil
+	}
+	delete(poller.pending, overlapped)
+	request.pin.Unpin() // Completion has released every buffer retained by AFD.
+	registration := request.registration
+	registration.pending = nil
+	if poller.closed || poller.sockets[int(registration.socket)] != registration {
+		return EpollEvent{}, false, nil
+	}
+	if request.generation != registration.generation || uint32(request.io.Internal) == 0xc0000120 {
+		return EpollEvent{}, false, poller.submit(registration)
+	}
+	mask := request.info.Events
+	if int32(request.io.Internal) < 0 || request.info.Status < 0 || request.info.Count == 0 {
+		mask = 0 // An unsuccessful operation can leave the input mask untouched.
+	}
+	if mask&0x20 != 0 {
+		delete(poller.sockets, int(registration.socket))
+		return EpollEvent{}, false, nil
+	}
+	event := registration.event
+	event.Events = 0
+	if int32(request.io.Internal) < 0 || request.info.Status < 0 {
+		event.Events |= EPOLLERR
+	}
+	if mask&(0x01|0x80) != 0 {
+		event.Events |= EPOLLIN
+	}
+	if mask&0x02 != 0 {
+		event.Events |= EPOLLPRI
+	}
+	if mask&0x04 != 0 {
+		event.Events |= EPOLLOUT
+	}
+	if mask&0x08 != 0 {
+		event.Events |= EPOLLIN | EPOLLRDHUP
+	}
+	if mask&0x10 != 0 {
+		event.Events |= EPOLLHUP
+	}
+	if mask&0x100 != 0 {
+		event.Events |= EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDHUP
+	}
+	event.Events &= registration.event.Events | EPOLLERR | EPOLLHUP
+	if event.Events == 0 {
+		return EpollEvent{}, false, poller.submit(registration)
+	}
+	if registration.event.Events&EPOLLONESHOT != 0 {
+		registration.enabled = false
+	} else {
+		// Level-triggered sockets are resubmitted on the next Wait, preventing
+		// one readable socket from filling the entire current result batch.
+		poller.rearm = append(poller.rearm, registration)
+	}
+	return event, true, nil
+}
+
+func EpollWait(epfd int, events []EpollEvent, msec int) (int, error) {
+	if len(events) == 0 || msec < -1 {
+		return 0, EINVAL
+	}
+	value, ok := epollPorts.Load(epfd)
+	if !ok {
+		return 0, EBADF
+	}
+	poller := value.(*epollPort)
+	poller.waitMu.Lock()
+	defer poller.waitMu.Unlock()
+	poller.mu.Lock()
+	if poller.closed {
+		poller.mu.Unlock()
+		return 0, EBADF
+	}
+	for _, registration := range poller.rearm {
+		if registration.enabled && registration.pending == nil && poller.sockets[int(registration.socket)] == registration {
+			if err := poller.submit(registration); err != nil {
+				poller.mu.Unlock()
+				return 0, err
+			}
+		}
+	}
+	poller.rearm = nil
+	poller.mu.Unlock()
+	started, _, _ := epollClock.Call()
+	count := 0
+	for count < len(events) {
+		timeout := uint32(INFINITE)
+		if count > 0 {
+			timeout = 0
+		} else if msec >= 0 {
+			now, _, _ := epollClock.Call()
+			remaining := int64(msec) - int64(now-started)
+			if remaining < 0 {
+				remaining = 0
+			}
+			timeout = uint32(min(remaining, int64(INFINITE-1)))
+		}
+		var bytes uint32
+		var key uintptr
+		var overlapped *Overlapped
+		err := getQueuedCompletionStatus(poller.port, &bytes, &key, &overlapped, timeout)
+		poller.mu.Lock()
+		if poller.closed {
+			if overlapped != nil {
+				poller.complete(overlapped)
+			}
+			poller.mu.Unlock()
+			return count, EBADF
+		}
+		if overlapped == nil {
+			poller.mu.Unlock()
+			if err == Errno(WAIT_TIMEOUT) {
+				return count, nil
+			}
+			if err != nil {
+				return count, err
+			}
+			continue
+		}
+		event, ready, completeErr := poller.complete(overlapped)
+		poller.mu.Unlock()
+		if completeErr != nil {
+			return count, completeErr
+		}
+		if ready {
+			events[count] = event
+			count++
+		}
+	}
+	return count, nil
+}
+
+// EpollClose cancels and drains native operations before releasing pinned Go
+// memory. It wakes a blocked EpollWait; concurrent control calls return EBADF.
+func EpollClose(epfd int) error {
+	value, ok := epollPorts.Load(epfd)
+	if !ok {
+		return EBADF
+	}
+	poller := value.(*epollPort)
+	poller.mu.Lock()
+	if poller.closed {
+		poller.mu.Unlock()
+		return EBADF
+	}
+	for _, request := range poller.pending {
+		if err := poller.cancel(request.registration); err != nil {
+			poller.mu.Unlock()
+			return err
+		}
+	}
+	if err := postQueuedCompletionStatus(poller.port, 0, 0, nil); err != nil {
+		poller.mu.Unlock()
+		return err
+	}
+	poller.closed = true
+	poller.mu.Unlock()
+	poller.waitMu.Lock()
+	defer poller.waitMu.Unlock()
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	for len(poller.pending) > 0 {
+		var bytes uint32
+		var key uintptr
+		var overlapped *Overlapped
+		err := getQueuedCompletionStatus(poller.port, &bytes, &key, &overlapped, INFINITE)
+		if overlapped != nil {
+			poller.complete(overlapped)
+		} else if err != nil {
+			return err
+		}
+	}
+	epollPorts.Delete(epfd)
+	CloseHandle(poller.afd)
+	return CloseHandle(poller.port)
+}
