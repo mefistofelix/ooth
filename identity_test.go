@@ -52,18 +52,31 @@ func TestIdentityHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func runIdentityWorker(t *testing.T, executable string, identity Identity) map[string]string {
+func runIdentityWorker(t *testing.T, executable string, identity Identity, network string) map[string]string {
 	t.Helper()
 	owner, err := newProcessOwner("", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer owner.Close()
-	listener, err := OpenListener("tcp", "127.0.0.1:0")
+	address := "127.0.0.1:0"
+	if network == "unix" {
+		address = filepath.Join(t.TempDir(), "worker.sock")
+	}
+	listener, err := OpenListener(network, address)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	if network == "unix" {
+		finish, err := identity.socket(address, 0660)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := finish(true); err != nil {
+			t.Fatal(err)
+		}
+	}
 	file, err := listener.ChildFile()
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +104,7 @@ func runIdentityWorker(t *testing.T, executable string, identity Identity) map[s
 			owner.Wait(job)
 		}
 	}()
-	connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	connection, err := net.DialTimeout(network, listener.Addr().String(), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,9 +135,13 @@ func TestIdentityCurrentUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply := runIdentityWorker(t, executable, Identity{User: account.Username})
-	if reply["uid"] != account.Uid {
-		t.Fatalf("worker identity: %v, expected %s", reply, account.Uid)
+	for _, network := range []string{"tcp", "unix"} {
+		t.Run(network, func(t *testing.T) {
+			reply := runIdentityWorker(t, executable, Identity{User: account.Username}, network)
+			if reply["uid"] != account.Uid {
+				t.Fatalf("worker identity: %v, expected %s", reply, account.Uid)
+			}
+		})
 	}
 }
 

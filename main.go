@@ -79,6 +79,90 @@ type Identity struct {
 	Password *string `yaml:"password"`
 }
 
+type Permissions uint32
+
+func (mode *Permissions) UnmarshalYAML(data []byte) error {
+	var value any
+	if err := yaml.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var bits uint64
+	var err error
+	switch value := value.(type) {
+	case uint64:
+		bits = value
+	case int64:
+		bits = uint64(value)
+	case string:
+		bits, err = parsePermissions(value)
+	default:
+		err = fmt.Errorf("socket_mode must be octal or symbolic permissions")
+	}
+	if err != nil {
+		return err
+	}
+	if bits > 0777 {
+		return fmt.Errorf("socket_mode must contain only rwx permission bits")
+	}
+	*mode = Permissions(bits)
+	return nil
+}
+
+func (mode Permissions) MarshalYAML() (any, error) {
+	return fmt.Sprintf("%04o", mode), nil
+}
+
+func parsePermissions(value string) (uint64, error) {
+	if bits, err := strconv.ParseUint(strings.TrimPrefix(value, "0o"), 8, 32); err == nil {
+		return bits, nil
+	}
+	mode := uint64(0660)
+	invalid := fmt.Errorf("socket_mode requires octal or clauses like u=rw,g=rw,o= using u/g/o/a, =/+/- and r/w/x")
+	for _, clause := range strings.Split(value, ",") {
+		index := strings.IndexAny(clause, "=+-")
+		if index < 1 {
+			return 0, invalid
+		}
+		var mask, bits uint64
+		for _, who := range clause[:index] {
+			switch who {
+			case 'u':
+				mask |= 0700
+			case 'g':
+				mask |= 0070
+			case 'o':
+				mask |= 0007
+			case 'a':
+				mask |= 0777
+			default:
+				return 0, invalid
+			}
+		}
+		for _, permission := range clause[index+1:] {
+			switch permission {
+			case 'r':
+				bits |= 0444
+			case 'w':
+				bits |= 0222
+			case 'x':
+				bits |= 0111
+			default:
+				return 0, invalid
+			}
+		}
+		bits &= mask
+		switch clause[index] {
+		case '=':
+			mode = mode&^mask | bits
+		case '+':
+			mode |= bits
+		case '-':
+			mode &^= bits
+		}
+	}
+	return mode, nil
+}
+
 type App struct {
 	Identity       Identity          `yaml:",inline"`
 	Name           string            `yaml:"name"`
@@ -89,6 +173,7 @@ type App struct {
 	Directory      string            `yaml:"directory"`
 	Env            map[string]string `yaml:"env"`
 	Listen         Socket            `yaml:"listen"`
+	SocketMode     *Permissions      `yaml:"socket_mode"`
 	MinWorkers     int               `yaml:"min_workers"`
 	MaxWorkers     int               `yaml:"max_workers"`
 	Concurrency    int               `yaml:"concurrency"`
@@ -247,6 +332,9 @@ func validateDependencies(apps map[string]App) error {
 }
 
 func (app App) validate() error {
+	if app.SocketMode != nil && (runtime.GOOS != "linux" || app.Listen.Network != "unix" || *app.SocketMode > 0777) {
+		return fmt.Errorf("socket_mode requires a Linux Unix socket and permissions between 0000 and 0777")
+	}
 	if app.Identity.Password != nil && app.Identity.User == "" {
 		return fmt.Errorf("password requires user")
 	}
@@ -836,8 +924,14 @@ func (manager *manager) apply(snapshot Snapshot) error {
 		return fmt.Errorf("changing cgroup requires restarting ooth")
 	}
 	opened := make(map[string]*serviceListener)
+	var permissions []func(bool) error
 	committed := false
 	defer func() {
+		for index := len(permissions) - 1; index >= 0; index-- {
+			if err := permissions[index](committed); err != nil {
+				manager.fatal = fmt.Errorf("finish socket permissions: %w", err)
+			}
+		}
 		if !committed {
 			for _, listener := range opened {
 				listener.close()
@@ -868,6 +962,24 @@ func (manager *manager) apply(snapshot Snapshot) error {
 			return fmt.Errorf("%s: register listener: %w", name, err)
 		}
 		opened[name] = staged
+	}
+	for name, app := range snapshot.Apps {
+		if app.Listen.Network != "unix" {
+			continue
+		}
+		previous := manager.services[name]
+		if previous != nil && previous.config.Listen == app.Listen && previous.config.Identity.User == app.Identity.User && previous.config.Identity.Group == app.Identity.Group && reflect.DeepEqual(previous.config.SocketMode, app.SocketMode) {
+			continue
+		}
+		mode := os.FileMode(0660)
+		if app.SocketMode != nil {
+			mode = os.FileMode(*app.SocketMode)
+		}
+		finish, err := app.Identity.socket(app.Listen.Address, mode)
+		if err != nil {
+			return fmt.Errorf("%s: socket permissions: %w", name, err)
+		}
+		permissions = append(permissions, finish)
 	}
 	for name, previous := range manager.services {
 		next, exists := snapshot.Apps[name]

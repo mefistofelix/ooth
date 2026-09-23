@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 )
 
 func treeOwnershipAvailable(*processOwner) bool { return true }
@@ -116,8 +117,67 @@ func TestIdentityDifferentWindowsUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply := runIdentityWorker(t, executable, Identity{User: username, Password: &password})
-	if reply["uid"] != account.Uid {
-		t.Fatalf("worker SID %s, expected %s", reply["uid"], account.Uid)
+	for _, network := range []string{"tcp", "unix"} {
+		reply := runIdentityWorker(t, executable, Identity{User: username, Password: &password}, network)
+		if reply["uid"] != account.Uid {
+			t.Fatalf("worker SID %s, expected %s", reply["uid"], account.Uid)
+		}
+	}
+}
+
+func socketSecurity(t *testing.T, path string) (string, string) {
+	t.Helper()
+	name, _ := syscall.UTF16PtrFromString(path)
+	handle, err := syscall.CreateFile(name, 0x20000, 7, nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.CloseHandle(handle)
+	var descriptor unsafe.Pointer
+	var owner *syscall.SID
+	if code, _, _ := getSecurityInfo.Call(uintptr(handle), 1, 5, uintptr(unsafe.Pointer(&owner)), 0, 0, 0, uintptr(unsafe.Pointer(&descriptor))); code != 0 {
+		t.Fatal(syscall.Errno(code))
+	}
+	defer syscall.LocalFree(syscall.Handle(uintptr(descriptor)))
+	sid, err := owner.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text *uint16
+	var size uint32
+	convert := jobSecurity.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")
+	if ok, _, err := convert.Call(uintptr(descriptor), 1, 5, uintptr(unsafe.Pointer(&text)), uintptr(unsafe.Pointer(&size))); ok == 0 {
+		t.Fatal(err)
+	}
+	defer syscall.LocalFree(syscall.Handle(uintptr(unsafe.Pointer(text))))
+	return sid, syscall.UTF16ToString(unsafe.Slice(text, size))
+}
+
+func TestSocketIdentityWindows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	listener, err := OpenListener("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	previousOwner, previous := socketSecurity(t, path)
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish, err := (Identity{User: account.Username}).socket(path, 0660)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, descriptor := socketSecurity(t, path)
+	if owner != account.Uid || !strings.Contains(descriptor, "D:P") || !strings.Contains(descriptor, "(A;;FA;;;"+account.Uid+")") || strings.Contains(descriptor, ";;;WD)") || strings.Contains(descriptor, ";;;BU)") {
+		t.Errorf("unexpected socket owner/ACL: %s %s", owner, descriptor)
+	}
+	if err := finish(false); err != nil {
+		t.Fatal(err)
+	}
+	restoredOwner, restored := socketSecurity(t, path)
+	if restoredOwner != previousOwner || restored != previous {
+		t.Fatalf("security rollback: before %s; after %s", previous, restored)
 	}
 }

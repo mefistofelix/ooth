@@ -183,15 +183,107 @@ func TestIdentityDifferentLinuxUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, identity := range []Identity{{User: account.Username, Group: group.Name}, {User: account.Uid, Group: group.Gid}} {
-		reply := runIdentityWorker(t, path, identity)
-		if reply["uid"] != account.Uid || reply["gid"] != group.Gid {
-			t.Fatalf("worker identity: %v", reply)
-		}
-		for _, group := range strings.Split(reply["groups"], ",") {
-			if group == "0" {
-				t.Fatal("worker retained the supervisor's root group")
+		for _, network := range []string{"tcp", "unix"} {
+			reply := runIdentityWorker(t, path, identity, network)
+			if reply["uid"] != account.Uid || reply["gid"] != group.Gid {
+				t.Fatalf("worker identity: %v", reply)
+			}
+			for _, group := range strings.Split(reply["groups"], ",") {
+				if group == "0" {
+					t.Fatal("worker retained the supervisor's root group")
+				}
 			}
 		}
+	}
+}
+
+func TestSocketIdentityLinux(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.sock")
+	listener, err := OpenListener("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := os.Geteuid(), os.Getegid()
+	if uid == 0 {
+		uid, gid = 65534, 1
+	}
+	identity := Identity{User: strconv.Itoa(uid), Group: strconv.Itoa(gid)}
+	finish, err := identity.socket(path, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := after.Sys().(*syscall.Stat_t)
+	if stat.Uid != uint32(uid) || stat.Gid != uint32(gid) || after.Mode().Perm() != 0600 {
+		t.Errorf("unexpected socket ownership: %+v %v", stat, after.Mode())
+	}
+	if err := finish(false); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, current := before.Sys().(*syscall.Stat_t), restored.Sys().(*syscall.Stat_t)
+	if previous.Uid != current.Uid || previous.Gid != current.Gid || before.Mode() != restored.Mode() {
+		t.Fatal("socket permission rollback did not restore original metadata")
+	}
+}
+
+func TestSocketModeReload(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "ooth.yaml")
+	address := filepath.Join(directory, "web.sock")
+	write(t, path, "watch: ['app/ooth.yaml']\n")
+	poller, err := NewPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poller.Close()
+	manager := &manager{poller: poller, services: make(map[string]*service), listeners: make(map[int32]*service), log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	defer manager.shutdown()
+	var original *serviceListener
+	for _, setting := range []struct {
+		text string
+		bits os.FileMode
+	}{{"", 0660}, {"0600", 0600}, {"0000", 0}, {"0666", 0666}, {"'u=rw,g=r,o='", 0640}, {"'a+rw'", 0666}} {
+		mode := setting.text
+		app := "name: web\ncommand: [worker]\nlisten: {network: unix, address: '" + address + "'}\n"
+		if mode != "" {
+			app += "socket_mode: " + mode + "\n"
+		}
+		write(t, filepath.Join(directory, "app", "ooth.yaml"), app)
+		snapshot, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.apply(snapshot); err != nil {
+			t.Fatal(err)
+		}
+		current := manager.services["web"].listener
+		if original != nil && current != original {
+			t.Fatal("mode update replaced the listening socket")
+		}
+		original = current
+		info, err := os.Lstat(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != setting.bits {
+			t.Fatalf("socket_mode %s produced %v", mode, info.Mode())
+		}
+	}
+	write(t, filepath.Join(directory, "app", "ooth.yaml"), "command: [worker]\nlisten: {network: unix, address: '"+address+"'}\nsocket_mode: 01777\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("accepted non-permission mode bits")
 	}
 }
 

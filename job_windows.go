@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"os/user"
 	"strings"
@@ -17,7 +19,13 @@ var setJobInformation = jobKernel.NewProc("SetInformationJobObject")
 var queryJobInformation = jobKernel.NewProc("QueryInformationJobObject")
 var terminateJobObject = jobKernel.NewProc("TerminateJobObject")
 var isProcessInJob = jobKernel.NewProc("IsProcessInJob")
-var logonUser = syscall.NewLazyDLL("advapi32.dll").NewProc("LogonUserW")
+var jobSecurity = syscall.NewLazyDLL("advapi32.dll")
+var logonUser = jobSecurity.NewProc("LogonUserW")
+var getSecurityInfo = jobSecurity.NewProc("GetSecurityInfo")
+var setSecurityInfo = jobSecurity.NewProc("SetSecurityInfo")
+var securityDescriptorFromString = jobSecurity.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
+var getDescriptorDACL = jobSecurity.NewProc("GetSecurityDescriptorDacl")
+var getDescriptorControl = jobSecurity.NewProc("GetSecurityDescriptorControl")
 
 func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
 	if identity.Group != "" {
@@ -77,6 +85,87 @@ func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
 	attr.Token = token
 	cmd.SysProcAttr = &attr
 	return func() { token.Close() }, nil
+}
+
+// Operate on the AF_UNIX reparse point itself, without following its tag.
+func (identity Identity) socket(path string, _ os.FileMode) (func(bool) error, error) {
+	current, err := user.Current()
+	if err != nil {
+		return nil, err
+	}
+	account := current
+	if identity.User != "" {
+		account, err = user.Lookup(identity.User)
+		if err != nil {
+			return nil, err
+		}
+	}
+	owner, err := syscall.StringToSid(account.Uid)
+	if err != nil {
+		return nil, err
+	}
+	// Keep supervisor access for reload/cleanup; do not inherit broad directory ACLs.
+	sddl := "D:P(A;;FA;;;SY)(A;;FA;;;" + account.Uid + ")"
+	if current.Uid != account.Uid {
+		sddl += "(A;;FA;;;" + current.Uid + ")"
+	}
+	text, _ := syscall.UTF16PtrFromString(sddl)
+	var descriptor unsafe.Pointer
+	if ok, _, err := securityDescriptorFromString.Call(uintptr(unsafe.Pointer(text)), 1, uintptr(unsafe.Pointer(&descriptor)), 0); ok == 0 {
+		return nil, err
+	}
+	defer syscall.LocalFree(syscall.Handle(uintptr(descriptor)))
+	var dacl unsafe.Pointer
+	var present, defaulted uint32
+	if ok, _, err := getDescriptorDACL.Call(uintptr(descriptor), uintptr(unsafe.Pointer(&present)), uintptr(unsafe.Pointer(&dacl)), uintptr(unsafe.Pointer(&defaulted))); ok == 0 {
+		return nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return nil, fmt.Errorf("%s is not a socket", path)
+	}
+	name, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := syscall.CreateFile(name, 0xE0000, 7, nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_OPEN_REPARSE_POINT, 0) // READ_CONTROL | WRITE_DAC | WRITE_OWNER
+	if err != nil {
+		return nil, err
+	}
+	var previous, previousOwner, previousDACL unsafe.Pointer
+	// SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
+	if code, _, _ := getSecurityInfo.Call(uintptr(handle), 1, 5, uintptr(unsafe.Pointer(&previousOwner)), 0, uintptr(unsafe.Pointer(&previousDACL)), 0, uintptr(unsafe.Pointer(&previous))); code != 0 {
+		syscall.CloseHandle(handle)
+		return nil, syscall.Errno(code)
+	}
+	var control uint16
+	var revision uint32
+	if ok, _, err := getDescriptorControl.Call(uintptr(previous), uintptr(unsafe.Pointer(&control)), uintptr(unsafe.Pointer(&revision))); ok == 0 {
+		syscall.LocalFree(syscall.Handle(uintptr(previous)))
+		syscall.CloseHandle(handle)
+		return nil, err
+	}
+	finish := func(commit bool) error {
+		defer syscall.LocalFree(syscall.Handle(uintptr(previous)))
+		var restoreErr error
+		if !commit {
+			flags := uintptr(5 | 0x20000000) // UNPROTECTED_DACL_SECURITY_INFORMATION
+			if control&0x1000 != 0 {         // SE_DACL_PROTECTED
+				flags = 5 | 0x80000000
+			}
+			if code, _, _ := setSecurityInfo.Call(uintptr(handle), 1, flags, uintptr(previousOwner), 0, uintptr(previousDACL), 0); code != 0 {
+				restoreErr = syscall.Errno(code)
+			}
+		}
+		return errors.Join(restoreErr, syscall.CloseHandle(handle))
+	}
+	if code, _, _ := setSecurityInfo.Call(uintptr(handle), 1, 5|0x80000000, uintptr(unsafe.Pointer(owner)), 0, uintptr(dacl), 0); code != 0 {
+		return nil, errors.Join(syscall.Errno(code), finish(false))
+	}
+	return finish, nil
 }
 
 type processOwner struct{}

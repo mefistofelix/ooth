@@ -70,6 +70,9 @@ Application YAML may select an account for both socket workers and ordinary serv
 # Linux: names or numeric IDs of existing accounts/groups.
 user: www-data
 group: www-data
+# Optional, for listen.network: unix; default 0660.
+socket_mode: 0660
+# Equivalent symbolic spelling: socket_mode: "u=rw,g=rw,o="
 ```
 
 ```yaml
@@ -83,6 +86,12 @@ Linux sets the UID, primary GID and account's supplementary groups in the child.
 Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and stdin inheritance. A different account requires `password`; an explicit empty string is passed as an empty password. The current account can be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
 
 The password is read directly from YAML as requested; restrict that file's permissions. It is not placed in the worker's arguments or environment, and YAML diagnostics omit source excerpts. This switches process credentials, without loading a Windows profile or constructing a login environment; use `env` and `directory` for application settings. Linux rejects `password`; Windows rejects `group`. Linux different-user listener inheritance was tested locally; Windows current-user inheritance and authentication failures passed, while a successful different-account Windows spawn still needs validation with a suitable account. `OOTH_TEST_WINDOWS_USER` and `OOTH_TEST_WINDOWS_PASSWORD` enable that optional test only.
+
+The same identity owns the **filesystem Unix socket** used for activation. Linux applies UID/GID and `socket_mode`, defaulting to `0660`; this optional field accepts permission bits `0000` through `0777` and is rejected for TCP or Windows. Windows sets the account as owner and a protected ACL granting full access to that account, ooth's account and SYSTEM. Without an explicit identity, these defaults use ooth's current account/group. TCP listeners have no filesystem owner or mode. An ownership/permission error rejects the configuration; it does not silently expose the socket with different permissions. Identity and mode changes update a reused Unix listener, with permission rollback if the configuration cannot be applied. The socket directory must already allow the intended clients to traverse it and should restrict access during socket creation, before ooth applies the final file permissions. Assigning another Windows owner requires the relevant native ownership rights; ooth does not enable extra privileges automatically.
+
+Windows supports filesystem Unix sockets and enforces their file permissions, as described in Microsoft's [AF_UNIX documentation](https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/). Local tests verify ACL/owner changes and rollback, stdin inheritance, real request traffic, scaling and graceful shutdown with Go workers. Inheriting the listener avoids creating/binding it in the worker; the worker runtime still needs to adopt its native handle and support `accept` for that socket family.
+
+`socket_mode` accepts an octal YAML integer (`0660`, `0o660`), a quoted octal string (`"0660"`), or symbolic clauses (`"u=rw,g=rw,o="`, `"a+rw"`, `"g-w"`). Symbolic clauses are applied left to right to the fixed default `0660`, so reloads are deterministic and independent of the supervisor's umask or previous file mode. Supported selectors are `u`, `g`, `o`, `a`; each comma-separated clause has one `=`, `+` or `-` operator and `r`, `w`, `x` permissions. Other chmod features, including permission copying and special bits, are rejected.
 
 ## Virtual activation and dependencies
 

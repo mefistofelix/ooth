@@ -18,11 +18,27 @@ import (
 )
 
 func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
+	credential, err := identity.credentials()
+	if err != nil {
+		return nil, err
+	}
+	if credential != nil {
+		attr := syscall.SysProcAttr{}
+		if cmd.SysProcAttr != nil {
+			attr = *cmd.SysProcAttr
+		}
+		attr.Credential = credential
+		cmd.SysProcAttr = &attr
+	}
+	return func() {}, nil
+}
+
+func (identity Identity) credentials() (*syscall.Credential, error) {
 	if identity.Password != nil {
 		return nil, fmt.Errorf("password is only supported on Windows")
 	}
 	if identity.User == "" && identity.Group == "" {
-		return func() {}, nil
+		return nil, nil
 	}
 	var account *user.User
 	var err error
@@ -71,13 +87,40 @@ func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
 	}
 	// An unprivileged caller cannot call setgroups even for its own identity.
 	credential.NoSetGroups = os.Geteuid() != 0 && credential.Uid == uint32(os.Geteuid())
-	attr := syscall.SysProcAttr{}
-	if cmd.SysProcAttr != nil {
-		attr = *cmd.SysProcAttr
+	return credential, nil
+}
+
+// The returned function commits or restores permissions during config reload.
+func (identity Identity) socket(path string, mode os.FileMode) (func(bool) error, error) {
+	credential, err := identity.credentials()
+	if err != nil {
+		return nil, err
 	}
-	attr.Credential = credential
-	cmd.SysProcAttr = &attr
-	return func() {}, nil
+	uid, gid := os.Geteuid(), os.Getegid()
+	if credential != nil {
+		uid, gid = int(credential.Uid), int(credential.Gid)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return nil, fmt.Errorf("%s is not a socket", path)
+	}
+	previous := info.Sys().(*syscall.Stat_t)
+	finish := func(commit bool) error {
+		if commit {
+			return nil
+		}
+		return errors.Join(os.Chown(path, int(previous.Uid), int(previous.Gid)), os.Chmod(path, info.Mode().Perm()))
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		return nil, errors.Join(err, finish(false))
+	}
+	return finish, nil
 }
 
 type processOwner struct {
