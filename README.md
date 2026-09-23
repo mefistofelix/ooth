@@ -19,7 +19,7 @@ On Windows use Git Bash to build, then run `bin/ooth-windows-amd64.exe`. Set the
 
 The script downloads and verifies **Go 1.27.1**, patches its dedicated copy under `build/`, runs tests and `go vet`, then builds amd64 and arm64 binaries for the host OS. It never patches an existing Go installation. When the patch changes, affected source files are restored from the verified archive before applying it. The Go version is deliberately pinned: toolchain changes must be reviewed when upgrading Go. A stock `go build` is not supported.
 
-`-version` prints the commit/build version; `-debug` includes completed request metrics. The GitHub workflow tests on Linux and Windows on push. Run the workflow manually to publish a prerelease containing the four binaries and `SHA256SUMS`; arm64 is cross-compiled, while integration tests run on amd64.
+`-version` prints the commit/build version; `-debug` includes completed request metrics. Development changes are tested locally; pushes do not trigger GitHub builds. Run the workflow manually at agreed milestones to verify Linux and Windows on clean runners. Enable `publish_release` when that run should also publish a prerelease containing the four binaries and `SHA256SUMS`; otherwise it only builds/tests and uploads workflow artifacts. ARM64 is cross-compiled, while integration tests run on amd64.
 
 ## Configuration
 

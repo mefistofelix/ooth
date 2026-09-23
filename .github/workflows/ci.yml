@@ -1,7 +1,11 @@
 name: ci
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish prerelease binaries after the build
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,7 +32,7 @@ jobs:
             bin/THIRD_PARTY_NOTICES.md
 
   release:
-    if: github.event_name == 'workflow_dispatch'
+    if: inputs.publish_release
     needs: build
     runs-on: ubuntu-latest
     permissions:
