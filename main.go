@@ -1135,7 +1135,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 			child.failed = true
 			manager.stop(child, now, "missing ready handshake")
 		}
-		manager.log.Info("worker stdout detected", "pid", child.cmd.Process.Pid, "telemetry", child.telemetry)
+		manager.log.Info("worker stdout detected", "app", service.name, "pid", child.cmd.Process.Pid, "telemetry", child.telemetry)
 		return
 	}
 	if msg.err != nil {
@@ -1159,6 +1159,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		}
 		child.active[event.ID] = now
 		child.idleSince = time.Time{}
+		manager.log.Debug("request started", "app", service.name, "pid", child.cmd.Process.Pid, "id", event.ID, "ts", event.Time)
 	case "end":
 		if child.active[event.ID].IsZero() {
 			child.failed = true
@@ -1319,7 +1320,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			service.busySince = time.Time{}
 		}
 		grow := available < app.MinWorkers || (available == 0 && service.demand)
-		if available == 0 && wanted[service.name] {
+		if available == 0 && (app.Startup || required[service.name]) {
 			grow = true
 		}
 		grow = grow || (!service.busySince.IsZero() && now.Sub(service.busySince) >= app.ScaleDelay)

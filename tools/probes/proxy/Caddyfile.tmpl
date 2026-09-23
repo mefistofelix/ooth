@@ -1,0 +1,32 @@
+{
+    admin off
+    auto_https off
+    persist_config off
+    storage file_system {
+        root "{{.Root}}/caddy-storage"
+    }
+}
+http://{{.Address}} {
+    bind 127.0.0.1
+    handle /health {
+        respond "ready" 200
+    }
+    handle_path /python/* {
+        reverse_proxy {{.Python}} {
+            transport http {
+                keepalive off
+            }
+        }
+    }
+    handle_path /node/* {
+        reverse_proxy {{.Node}} {
+            transport http {
+                versions h2c
+            }
+        }
+    }
+    handle /php/* {
+        root * "{{.Root}}"
+        php_fastcgi {{.PHP}}
+    }
+}

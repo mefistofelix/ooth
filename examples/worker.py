@@ -51,6 +51,14 @@ while not stopping:
                 if not data:
                     break
                 request += data
+
+            # A numeric URL such as /600 lets the integration suite hold work
+            # for 600 ms while checking scaling; ordinary paths have no delay.
+            try:
+                delay_ms = int(request.split(b" ", 2)[1].strip(b"/"))
+            except (ValueError, IndexError):
+                delay_ms = 0
+            time.sleep(max(0, min(delay_ms, 2000)) / 1000)
             body = f"worker={os.getpid()} request={sequence}\n".encode()
             response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
             connection.sendall(response + str(len(body)).encode() + b"\r\n\r\n" + body)

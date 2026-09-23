@@ -1,0 +1,8 @@
+name: proxy
+command:
+{{range .Command}}  - {{printf "%q" .}}
+{{end}}
+directory: {{printf "%q" .Root}}
+startup: true
+ready: started
+stop_timeout: 3s

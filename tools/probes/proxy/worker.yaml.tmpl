@@ -1,0 +1,19 @@
+name: {{.Name}}
+command:
+{{range .Command}}  - {{printf "%q" .}}
+{{end}}
+env:
+{{range $key, $value := .Env}}  {{$key}}: {{printf "%q" $value}}
+{{end}}
+listen:
+  network: tcp
+  address: {{.Address}}
+ready: {{if .Telemetry}}event{{else}}started{{end}}
+min_workers: 0
+max_workers: 2
+concurrency: 1
+scale_delay: 50ms
+idle_timeout: 700ms
+start_timeout: 5s
+stop_timeout: 2s
+request_timeout: {{if .Telemetry}}3s{{else}}150ms{{end}}

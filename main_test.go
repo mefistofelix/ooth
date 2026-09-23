@@ -160,7 +160,8 @@ func TestActivationLifecycle(t *testing.T) {
 			writeApp(t, appPath, app)
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
-			go func() { done <- Run(ctx, path, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+			log := &proxyLog{apps: make(map[string]proxyWorkerState)}
+			go func() { done <- Run(ctx, path, slog.New(log)) }()
 			t.Cleanup(func() {
 				cancel()
 				select {
@@ -173,7 +174,17 @@ func TestActivationLifecycle(t *testing.T) {
 				}
 			})
 			first := request(t, network, address, "10ms first")
-			time.Sleep(650 * time.Millisecond)
+			// Race-instrumented helpers can deliberately delay process exit.
+			deadline := time.Now().Add(3 * time.Second)
+			for log.state("web").live != 0 && time.Now().Before(deadline) {
+				if log.state("web").spawned != 1 {
+					t.Fatal("idle retirement started an unsolicited replacement")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if state := log.state("web"); state.live != 0 || state.spawned != 1 {
+				t.Fatalf("idle pool must remain at zero: %+v", state)
+			}
 			second := request(t, network, address, "10ms second")
 			if strings.Fields(first)[0] == strings.Fields(second)[0] {
 				t.Fatal("idle worker was not replaced")

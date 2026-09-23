@@ -1,5 +1,7 @@
 # Manual platform probes
 
+The [Caddy/Nginx proxy suite](proxy/README.md) includes committed worker sources, ooth/webserver templates and local preparation commands for Python HTTP, Node h2c and stock PHP FastCGI. It also preserves the Windows PHP detection incompatibility and the explicit launcher needed for that runtime's stdio convention.
+
 Run these from the repository root after `bash ./build.sh`. They use the dedicated patched compiler and OS/interpreter facilities; the handoff comparison also uses a separate stock compiler. The Go files have `ignore` build tags because they are standalone probes, not application packages.
 
 Linux (requires Python 3, `unshare`, user namespaces and procfs):
@@ -16,6 +18,17 @@ The first probe creates a real PID namespace with ooth as PID 1, starts a proces
 Descendant ownership tests are part of the root Go suite. On Linux, set `OOTH_CGROUP_ROOT` to a delegated cgroup v2 and run the tests from that delegation; root is not required. `TestProcessJobOwnsOrphans` checks that a grandchild remains in its kernel group after its parent and optionally its root exit immediately, and that cleanup removes the surviving process and reaps zombies. `TestSupervisorCrashCleansDescendants` checks cleanup before restart. Without a writable cgroup the full ownership tests skip (an explicitly requested but unavailable test delegation fails); `TestCgroupUnavailableWarnsAndRuns` verifies the documented warning and direct-child fallback.
 
 For the separate migration-permission case, `OOTH_TEST_UNDELEGATED_GROUP` points at a cgroup whose directory and control files are writable to the test user, but whose common ancestor with the caller's cgroup does not permit migration. Run only `TestCgroupPlacementFallback` from outside that delegation. It verifies that failed atomic placement can fall back to a fresh command and emit the warning; Go commands cannot be started a second time after a failed Start.
+
+The previously local delegation setup is now `with-cgroup.sh`. It creates one private test subtree, runs as the named ordinary user, and removes that subtree on exit. From the repository root:
+
+```sh
+sudo bash tools/probes/with-cgroup.sh "$USER" env CGO_ENABLED=0 ./build/linux-amd64/go/bin/go test -timeout 90s .
+sudo bash tools/probes/with-cgroup.sh "$USER" env CGO_ENABLED=1 ./build/linux-amd64/go/bin/go test -race -timeout 90s .
+sudo bash tools/probes/with-cgroup.sh "$USER" --outside env CGO_ENABLED=0 ./build/linux-amd64/go/bin/go test -run TestCgroupPlacementFallback -v .
+sudo env CGO_ENABLED=0 ./build/linux-amd64/go/bin/go test -run 'TestIdentityDifferentLinuxUser|TestSocketIdentityLinux' -v .
+```
+
+The root-only identity test copies its fixture executable into an accessible temporary directory, drops to a different UID/GID and accepts on inherited TCP and Unix listeners. Windows identity tests cover the current account and failed authentication; a positive different-account test requires the test-only credential variables documented in the root README.
 
 Windows ownership tests also check rejected breakaway, invalid creation-time Job assignment without running child code, and kernel cleanup when the Job-owning process exits without calling Close. Job utilities remain in application platform files; only creation-time assignment needs the new stdlib spawn field.
 
