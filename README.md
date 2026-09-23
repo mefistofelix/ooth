@@ -106,7 +106,7 @@ The Windows toolchain patch:
 
 - Waits for listener readiness with `WSAPoll`, without accepting anything. It checks deadline/close state every 20 ms; this uses an OS wait thread per active wait and is a known scaling cost.
 - Inherits the Winsock handle directly. Shared listeners use local completion events instead of binding the shared socket to one process's IOCP. Connected sockets retain Go's normal I/O implementation.
-- Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
+- Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. Visible GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
 - Uses `Process.Kill` after the configured timeout. No `taskkill`, PowerShell, or shell command is launched by ooth.
 
 Workers must handle the graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Windows SCM service control is not implemented. Process termination targets the direct worker; descendants must be managed by the worker rather than daemonized independently.
@@ -117,6 +117,6 @@ Go workers that share a Windows listener must use this patched toolchain too, in
 
 The application is in `main.go`; integration helpers are in `main_test.go`, and toolchain changes in `tools/patchgo`. The earlier prototype under `src/` and original patch under `golang_patch/` are retained as historical material, excluded from the root module's builds.
 
-Integration tests cover cold activation, TCP/Unix listeners, multiple worker processes, idle return to zero, virtual prerequisites, rejected configuration, graceful draining and forced termination. Set `OOTH_TEST_PYTHON` to an interpreter's absolute path to test the Python example as well. The workflow enables that test. GUI notifications and operation as Linux PID 1 need additional platform-specific validation before production use.
+Integration tests cover cold activation, TCP/Unix listeners, multiple worker processes, idle return to zero, virtual prerequisites, added/reloaded/removed applications, rejected configuration, graceful draining and forced termination. Set `OOTH_TEST_PYTHON` to an interpreter's absolute path to test the Python example as well. The workflow enables that test. The Linux suite also passed `go test -race` locally. Additional [platform probes](tools/probes/README.md) verified actual Linux PID 1 orphan reaping, Windows GUI shutdown and operation without a console or inherited standard handles. These are bounded checks, not a claim of compatibility with every worker/runtime.
 
 Dependencies: `sgtdi/fswatcher v1.3.0`, `goccy/go-yaml v1.19.2`, and fswatcher's indirect `golang.org/x/sys`. [Canonical Pebble](https://github.com/canonical/pebble) is an architectural reference, not a dependency.

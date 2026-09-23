@@ -9,10 +9,11 @@ var generateConsoleEvent = syscall.NewLazyDLL("kernel32.dll").NewProc("GenerateC
 var closeWindows = syscall.NewLazyDLL("user32.dll")
 var enumWindows = closeWindows.NewProc("EnumWindows")
 var windowProcess = closeWindows.NewProc("GetWindowThreadProcessId")
+var windowVisible = closeWindows.NewProc("IsWindowVisible")
 var postWindowMessage = closeWindows.NewProc("PostMessageW")
 
 type closeRequest struct {
-	pid uint32
+	pid    uint32
 	posted bool
 }
 
@@ -20,7 +21,8 @@ var closeWindowCallback = syscall.NewCallback(func(window, context uintptr) uint
 	request := (*closeRequest)(unsafe.Pointer(context))
 	var pid uint32
 	windowProcess.Call(window, uintptr(unsafe.Pointer(&pid)))
-	if pid == request.pid {
+	visible, _, _ := windowVisible.Call(window)
+	if pid == request.pid && visible != 0 {
 		ok, _, _ := postWindowMessage.Call(window, 0x0010, 0, 0) // WM_CLOSE
 		request.posted = request.posted || ok != 0
 	}

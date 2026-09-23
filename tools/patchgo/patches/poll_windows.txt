@@ -12,7 +12,7 @@ var readinessPoll = readinessWinsock.NewProc("WSAPoll")
 // already sets the event's low bit to suppress packets to an external IOCP.
 func (fd *FD) waitSharedIO(o *operation) error {
 	for {
-		status, err := syscall.WaitForSingleObject(o.o.HEvent &^ 1, 20)
+		status, err := syscall.WaitForSingleObject(o.o.HEvent&^1, 20)
 		if err != nil {
 			return err
 		}
@@ -24,7 +24,7 @@ func (fd *FD) waitSharedIO(o *operation) error {
 				panic(cancelErr)
 			}
 			// The kernel must release the pinned buffers before execIO returns.
-			syscall.WaitForSingleObject(o.o.HEvent &^ 1, syscall.INFINITE)
+			syscall.WaitForSingleObject(o.o.HEvent&^1, syscall.INFINITE)
 			return err
 		}
 	}
@@ -34,8 +34,8 @@ func (fd *FD) waitSharedIO(o *operation) error {
 // to post without consuming a connection, so the toolchain uses WSAPoll here.
 func (fd *FD) waitSocketReadable() error {
 	poll := struct {
-		Socket syscall.Handle
-		Events int16
+		Socket  syscall.Handle
+		Events  int16
 		Revents int16
 	}{Socket: fd.Sysfd, Events: 0x0100}
 	for {
