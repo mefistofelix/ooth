@@ -1,0 +1,56 @@
+package poll
+
+import (
+	"syscall"
+	"unsafe"
+)
+
+var readinessWinsock = syscall.NewLazyDLL("ws2_32.dll")
+var readinessPoll = readinessWinsock.NewProc("WSAPoll")
+
+// Keep each AcceptEx completion local to its process. Go's event-based path
+// already sets the event's low bit to suppress packets to an external IOCP.
+func (fd *FD) waitSharedIO(o *operation) error {
+	for {
+		status, err := syscall.WaitForSingleObject(o.o.HEvent &^ 1, 20)
+		if err != nil {
+			return err
+		}
+		if status == syscall.WAIT_OBJECT_0 {
+			return nil
+		}
+		if err := fd.pd.prepare(int(o.mode), fd.isFile); err != nil {
+			if cancelErr := syscall.CancelIoEx(fd.Sysfd, &o.o); cancelErr != nil && cancelErr != syscall.ERROR_NOT_FOUND {
+				panic(cancelErr)
+			}
+			// The kernel must release the pinned buffers before execIO returns.
+			syscall.WaitForSingleObject(o.o.HEvent &^ 1, syscall.INFINITE)
+			return err
+		}
+	}
+}
+
+// Windows' IOCP reports completed operations. A listener has no read operation
+// to post without consuming a connection, so the toolchain uses WSAPoll here.
+func (fd *FD) waitSocketReadable() error {
+	poll := struct {
+		Socket syscall.Handle
+		Events int16
+		Revents int16
+	}{Socket: fd.Sysfd, Events: 0x0100}
+	for {
+		if err := fd.pd.prepareRead(fd.isFile); err != nil {
+			return err
+		}
+		result, _, callError := readinessPoll.Call(uintptr(unsafe.Pointer(&poll)), 1, 20)
+		if int32(result) == -1 {
+			return callError
+		}
+		if poll.Revents&0x0007 != 0 {
+			return syscall.EINVAL
+		}
+		if poll.Revents&0x0100 != 0 {
+			return nil
+		}
+	}
+}

@@ -1,0 +1,5 @@
+//go:build !windows
+
+package exec
+
+func (c *Cmd) prepareProcessGroup() error { return nil }

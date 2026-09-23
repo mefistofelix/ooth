@@ -1,0 +1,52 @@
+name: ci
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - shell: bash
+        run: |
+          export OOTH_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          bash ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}
+          path: |
+            bin/ooth-*
+            bin/THIRD_PARTY_NOTICES.md
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: bin
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd bin
+          sha256sum ooth-* > SHA256SUMS
+          tag="${GITHUB_SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" ooth-* SHA256SUMS THIRD_PARTY_NOTICES.md --clobber
+          else
+            gh release create "$tag" ooth-* SHA256SUMS THIRD_PARTY_NOTICES.md --target "$GITHUB_SHA" --title "ooth $tag" --notes 'Experimental Linux and Windows builds. See README for worker conventions and platform limitations.' --prerelease
+          fi

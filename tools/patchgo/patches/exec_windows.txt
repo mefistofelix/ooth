@@ -1,0 +1,41 @@
+package exec
+
+import (
+	"fmt"
+	"sync"
+	"syscall"
+)
+
+var consoleOnce sync.Once
+var consoleError error
+
+func (c *Cmd) prepareProcessGroup() error {
+	if !c.NewProcessGroup {
+		return nil
+	}
+	consoleOnce.Do(func() {
+		kernel := syscall.NewLazyDLL("kernel32.dll")
+		consoleCP, _, _ := kernel.NewProc("GetConsoleCP").Call()
+		if consoleCP != 0 {
+			return
+		}
+		ok, _, err := kernel.NewProc("AllocConsole").Call()
+		if ok == 0 {
+			consoleError = fmt.Errorf("allocate console for graceful process signals: %w", err)
+			return
+		}
+		window, _, _ := kernel.NewProc("GetConsoleWindow").Call()
+		syscall.NewLazyDLL("user32.dll").NewProc("ShowWindow").Call(window, 0)
+	})
+	if consoleError != nil {
+		return consoleError
+	}
+	attr := syscall.SysProcAttr{}
+	if c.SysProcAttr != nil {
+		attr = *c.SysProcAttr
+	}
+	attr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
+	attr.HideWindow = true
+	c.SysProcAttr = &attr
+	return nil
+}

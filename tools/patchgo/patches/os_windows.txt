@@ -1,0 +1,44 @@
+package os
+
+import (
+	"syscall"
+	"unsafe"
+)
+
+var generateConsoleEvent = syscall.NewLazyDLL("kernel32.dll").NewProc("GenerateConsoleCtrlEvent")
+var closeWindows = syscall.NewLazyDLL("user32.dll")
+var enumWindows = closeWindows.NewProc("EnumWindows")
+var windowProcess = closeWindows.NewProc("GetWindowThreadProcessId")
+var postWindowMessage = closeWindows.NewProc("PostMessageW")
+
+type closeRequest struct {
+	pid uint32
+	posted bool
+}
+
+var closeWindowCallback = syscall.NewCallback(func(window, context uintptr) uintptr {
+	request := (*closeRequest)(unsafe.Pointer(context))
+	var pid uint32
+	windowProcess.Call(window, uintptr(unsafe.Pointer(&pid)))
+	if pid == request.pid {
+		ok, _, _ := postWindowMessage.Call(window, 0x0010, 0, 0) // WM_CLOSE
+		request.posted = request.posted || ok != 0
+	}
+	return 1
+})
+
+func signalConsoleGroup(pid int) error {
+	if pid <= 0 {
+		return syscall.EINVAL
+	}
+	request := closeRequest{pid: uint32(pid)}
+	enumWindows.Call(closeWindowCallback, uintptr(unsafe.Pointer(&request)))
+	if request.posted {
+		return nil
+	}
+	ok, _, err := generateConsoleEvent.Call(1, uintptr(pid)) // CTRL_BREAK_EVENT
+	if ok == 0 {
+		return NewSyscallError("GenerateConsoleCtrlEvent", err)
+	}
+	return nil
+}
