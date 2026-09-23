@@ -65,6 +65,33 @@ try {
 
 Both public Node paths failed with `EISDIR`. The native mode passed with three worker PIDs. **Native mode is diagnostic only**: it adds a known inherited socket handle through `AdditionalInheritedHandles`, passes its number in `HANDOFF_HANDLE`, and calls the private `process.binding('tcp_wrap')` API. It establishes that libuv can adopt this shared socket without a patched Go parent; it does not establish that Node's public API implements the production stdin convention. No new dependency or worker protocol extension was added to ooth.
 
+### Node through stdin alone
+
+Node 26 adds built-in [`node:ffi`](https://nodejs.org/api/ffi.html), allowing the worker to recover the native stdin socket directly. With Node 26.10.0/libuv 1.52.1, both paths below passed with three concurrent worker PIDs and a stock Go parent:
+
+```powershell
+$node = 'C:/path/to/node-v26.10.0-win-x64/node.exe'
+& ./build/handoff-stock.exe $node tools/probes/node_handoff.cjs stdhandle
+& ./build/handoff-stock.exe $node tools/probes/node_handoff.cjs osfhandle
+```
+
+Leave `HANDOFF_RAW` unset. `stdhandle` calls `GetStdHandle(STD_INPUT_HANDLE)` from `kernel32.dll`; `osfhandle` calls `_get_osfhandle(0)` from `ucrtbase.dll`. Both then pass the native socket to Node's private TCPWrap binding, which calls libuv. These modes require **no additional inherited handle, handle-number environment variable, IPC channel, npm dependency or Node patch**. Additional handle inheritance itself is a standard Windows/Go facility; the private part is Node's socket adoption API. FFI remains experimental, and TCPWrap is private, so these are compatibility probes, not a stable Node adapter. Node 24.19.0 lacks the built-in FFI module.
+
+`node_worker.cjs` exercises the actual ooth protocol over stdout and serves HTTP through stdin's listener. It handles SIGTERM on Linux and SIGBREAK on Windows, closes its listener, and lets active responses finish. `TestNodeWorker` verifies cold activation, idle shutdown and replacement, and draining a request during supervisor shutdown. A marker written only by the graceful handler distinguishes a cooperative exit from a forced kill.
+
+```powershell
+$env:OOTH_TEST_NODE = $node
+& ./build/windows-amd64/go/bin/go.exe test -run '^TestNodeWorker$' -v -timeout 30s .
+```
+
+On Linux the same fixture uses public `server.listen({fd: 0})`, without FFI or TCPWrap:
+
+```sh
+OOTH_TEST_NODE=/absolute/path/to/node ./build/linux-amd64/go/bin/go test -run '^TestNodeWorker$' -v -timeout 30s .
+```
+
+The lifecycle test passed locally on Windows amd64 and Linux amd64 in WSL, with Node 26.10.0. It is skipped unless `OOTH_TEST_NODE` is set. The runtime is a test tool, not an ooth dependency. Local portable archives were downloaded from nodejs.org into ignored `build/runtime-node/` and verified against the official `SHASUMS256.txt`; no system installation or CI trigger was changed. The runtime execution checks here cover Node, not Bun or Deno.
+
 Source audit:
 
 - [Microsoft `_get_osfhandle`](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-osfhandle?view=msvc-170) retrieves the native handle associated with a CRT file descriptor. It does not create a new socket or move one between IOCPs.

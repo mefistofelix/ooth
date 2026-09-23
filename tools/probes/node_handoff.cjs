@@ -6,12 +6,29 @@ server.on('error', error => {
   process.exitCode = 1;
 });
 
-if (mode === 'native') {
-  // Diagnostic only: private Node API and an extra inherited native handle.
-  // This is not the production ooth worker convention or a supported Node API.
+if (['native', 'stdhandle', 'osfhandle'].includes(mode)) {
+  // Diagnostic only: private Node API. stdhandle/osfhandle use only stdin;
+  // native is the older control experiment with an extra inherited handle.
+  let descriptor;
+  if (mode === 'native') {
+    descriptor = Number(process.env.HANDOFF_HANDLE);
+  } else {
+    const { dlopen } = require('node:ffi');
+    const kernel = mode === 'stdhandle';
+    const symbol = kernel ? 'GetStdHandle' : '_get_osfhandle';
+    const library = dlopen(kernel ? 'kernel32.dll' : 'ucrtbase.dll', {
+      [symbol]: {
+        arguments: [kernel ? 'uint32' : 'int32'],
+        return: 'int64',
+      },
+    });
+    descriptor = Number(library.functions[symbol](kernel ? 0xfffffff6 : 0));
+    library.lib.close();
+    console.error(`${symbol} stdin=${descriptor}`);
+  }
   const { TCP, constants } = process.binding('tcp_wrap');
   const handle = new TCP(constants.SERVER);
-  const error = handle.open(Number(process.env.HANDOFF_HANDLE));
+  const error = handle.open(descriptor);
   if (error) throw new Error(`uv_tcp_open: ${error}`);
   server.listen(handle, () => console.log('ready'));
 } else if (mode === 'stdin') {
@@ -19,5 +36,5 @@ if (mode === 'native') {
 } else if (mode === 'fd') {
   server.listen({ fd: 0 }, () => console.log('ready'));
 } else {
-  throw new Error('usage: node node_handoff.cjs [fd|stdin|native]');
+  throw new Error('usage: node node_handoff.cjs [fd|stdin|native|stdhandle|osfhandle]');
 }
