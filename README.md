@@ -28,6 +28,9 @@ Main `ooth.yaml`:
 ```yaml
 watch:
   - /var/www/app*/ooth.yaml
+resources:
+  max_cpu_percent: 90
+  min_available_memory_percent: 10
 ```
 
 Windows paths may use forward slashes, for example `C:/www/app*/ooth.yaml`. Patterns follow Go's `filepath.Glob`: `*` matches within one directory level; recursive `**` is not supported. Relative paths resolve against the YAML file that contains them. Changes and new matching files are watched with [sgtdi/fswatcher](https://github.com/sgtdi/fswatcher); a five-second rescan also reconciles missed events. YAML uses [goccy/go-yaml](https://github.com/goccy/go-yaml), with unknown fields rejected.
@@ -53,12 +56,21 @@ idle_timeout: 1m
 start_timeout: 10s
 stop_timeout: 10s
 request_timeout: 0s
-scale_delay: 100ms
+scale_at: 80%
+scale_window: 1s
 ```
 
 `command` is an argument list, executed directly without a shell. Workers must remain in the foreground. `name` defaults to the containing directory's name. Networks are `tcp`, `tcp4`, `tcp6`, and `unix`. On Windows, the worker's own language/runtime must also support Unix sockets; CPython's Windows build does not currently implement their accept path, so the Python example uses TCP there.
 
-Defaults are shown above except `max_workers`, which defaults to 1. `concurrency` describes how many simultaneous requests one worker can handle. When all ready workers remain saturated for `scale_delay`, ooth starts another, up to `max_workers`. This maintains spare capacity using worker events; it does not inspect the kernel's pending-connection count. Workers with no active requests for `idle_timeout` are stopped down to `min_workers`, including zero. A required dependency retains at least one worker. `request_timeout: 0s` disables the request watchdog.
+Defaults are shown above except `max_workers`, which defaults to 1. The six pool controls are `min_workers`, `max_workers`, `concurrency`, `scale_at`, `scale_window` and `idle_timeout`. `concurrency` is the sustainable simultaneous request count declared per worker; durations alone cannot reveal it. `scale_at` accepts a number or percentage, for example `80` or `80%`.
+
+ooth integrates occupancy at every start/end and evaluates successive complete `scale_window` intervals. Each ready telemetry worker contributes at most `concurrency` busy slots. Two workers with concurrency four averaging six active slots have 75% occupancy. An average at or above `scale_at` requests one extra worker, up to `max_workers`. A changed pool or any unready/non-telemetry member resets the window: new capacity must complete a fresh window before another increase. Brief requests between scheduler ticks count. These are consecutive windows, not a sliding average. The legacy `scale_delay` spelling aliases `scale_window` with this new behavior; specifying both is rejected.
+
+Global `resources` limits gate extra growth. One background sampler uses [gopsutil/v4](https://github.com/shirou/gopsutil) approximately once per second for CPU utilization and available RAM, without CGO or external commands on Linux/Windows. Defaults defer growth at 90% CPU or below 10% available RAM. Zero disables each threshold. Before the first sample, on measurement errors, or after three seconds without a fresh sample, extras wait. Errors warn on stderr; logs show pause/resume and debug samples. Limits reload without restarting workers. Cold activation, configured minimum, startup services and dependencies still start; the guard never stops running workers and is not a hard resource reservation.
+
+Linux also reads visible cgroup v2 ancestors of ooth and its worker delegation: CPU quota/cpuset capacity against usage deltas, and `memory.max` remaining after `memory.current`. Sibling consumption counts. The highest CPU utilization and lowest available-memory percentage across these scopes and the host govern growth. Cgroup memory accounting includes charged cache, making this reserve conservative. Reads need no writable delegation. Hidden ancestors, cgroup v1 and Windows container/Job quotas are not normalized; Windows uses host metrics.
+
+Listener notifications activate empty pools; they do not measure universal request pressure. Workers without the stdout handshake have no request-based scaling. Idle telemetry workers stop after `idle_timeout`, down to `min_workers`, including zero; required dependencies retain at least one. `request_timeout: 0s` disables the request watchdog.
 
 Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers count against `max_workers`, so an update can queue requests while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
 

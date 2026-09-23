@@ -155,7 +155,7 @@ func TestActivationLifecycle(t *testing.T) {
 			executable, _ := os.Executable()
 			app := App{Name: "web", Command: []string{executable, "-test.run=^TestWorkerHelper$"}, Env: map[string]string{"TEST_OOTH_WORKER": "1"}, Listen: Socket{network, address}, MaxWorkers: 2, Concurrency: 1, IdleTimeout: 250 * time.Millisecond, StartTimeout: 3 * time.Second, StopTimeout: time.Second, ScaleDelay: 50 * time.Millisecond}
 			path := filepath.Join(directory, "ooth.yaml")
-			write(t, path, "watch: ['app/ooth.yaml']\n")
+			write(t, path, "watch: ['app/ooth.yaml']\n"+unlimitedTestResources)
 			appPath := filepath.Join(directory, "app", "ooth.yaml")
 			writeApp(t, appPath, app)
 			ctx, cancel := context.WithCancel(context.Background())

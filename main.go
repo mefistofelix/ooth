@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +24,8 @@ import (
 
 	"github.com/goccy/go-yaml"
 	"github.com/sgtdi/fswatcher"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/mem"
 )
 
 var version = "dev"
@@ -64,8 +67,99 @@ func main() {
 }
 
 type Config struct {
-	Watch  []string `yaml:"watch"`
-	Cgroup string   `yaml:"cgroup"`
+	Watch     []string       `yaml:"watch"`
+	Cgroup    string         `yaml:"cgroup"`
+	Resources ResourceLimits `yaml:"resources"`
+}
+
+type ResourceLimits struct {
+	MaxCPUPercent             Percent `yaml:"max_cpu_percent"`
+	MinAvailableMemoryPercent Percent `yaml:"min_available_memory_percent"`
+}
+
+type Percent float64
+
+func (percent *Percent) UnmarshalYAML(data []byte) error {
+	var value any
+	if err := yaml.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	number, err := strconv.ParseFloat(strings.TrimSuffix(fmt.Sprint(value), "%"), 64)
+	if err != nil || math.IsNaN(number) || number < 0 || number > 100 {
+		return fmt.Errorf("percentage must be between 0 and 100")
+	}
+	*percent = Percent(number)
+	return nil
+}
+
+type resourceSample struct {
+	at                   time.Time
+	cpu, availableMemory float64
+	err                  error
+}
+
+type resourceGroup struct {
+	cpuSeconds, cores float64
+	availableMemory   float64
+}
+
+func (limits ResourceLimits) blocked(sample resourceSample, now time.Time) string {
+	if limits.MaxCPUPercent == 0 && limits.MinAvailableMemoryPercent == 0 {
+		return ""
+	}
+	if sample.at.IsZero() || now.Sub(sample.at) > 3*time.Second {
+		return "waiting for a fresh resource sample"
+	}
+	if sample.err != nil {
+		return "resource measurements unavailable"
+	}
+	if limits.MaxCPUPercent > 0 && sample.cpu >= float64(limits.MaxCPUPercent) {
+		return "CPU limit reached"
+	}
+	if limits.MinAvailableMemoryPercent > 0 && sample.availableMemory < float64(limits.MinAvailableMemoryPercent) {
+		return "available memory below reserve"
+	}
+	return ""
+}
+
+// Only this sampler blocks for the CPU interval; the supervisor keeps serving
+// process exits, deadlines and listener events while it runs.
+func sampleResources(ctx context.Context, owner *processOwner, samples chan<- resourceSample) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		started := time.Now()
+		before, beforeErr := owner.resourceGroups()
+		usage, cpuErr := cpu.PercentWithContext(ctx, time.Second, false)
+		memory, memoryErr := mem.VirtualMemoryWithContext(ctx)
+		after, afterErr := owner.resourceGroups()
+		sample := resourceSample{at: time.Now(), err: errors.Join(beforeErr, cpuErr, memoryErr, afterErr)}
+		if sample.err == nil {
+			sample.cpu = usage[0]
+			sample.availableMemory = 100 * float64(memory.Available) / float64(memory.Total)
+			for path, group := range after {
+				sample.availableMemory = min(sample.availableMemory, group.availableMemory)
+				previous, ok := before[path]
+				if group.cores > 0 {
+					if !ok || group.cpuSeconds < previous.cpuSeconds {
+						sample.err = fmt.Errorf("cgroup CPU counter changed during sampling: %s", path)
+						break
+					}
+					sample.cpu = max(sample.cpu, 100*(group.cpuSeconds-previous.cpuSeconds)/sample.at.Sub(started).Seconds()/group.cores)
+				}
+			}
+		}
+		select {
+		case samples <- sample:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 type Socket struct {
@@ -181,14 +275,17 @@ type App struct {
 	StartTimeout   time.Duration     `yaml:"start_timeout"`
 	StopTimeout    time.Duration     `yaml:"stop_timeout"`
 	RequestTimeout time.Duration     `yaml:"request_timeout"`
-	ScaleDelay     time.Duration     `yaml:"scale_delay"`
+	ScaleAt        Percent           `yaml:"scale_at,omitempty"`
+	ScaleWindow    time.Duration     `yaml:"scale_window,omitempty"`
+	ScaleDelay     time.Duration     `yaml:"scale_delay,omitempty"` // Legacy spelling of scale_window.
 	Source         string            `yaml:"-"`
 }
 
 type Snapshot struct {
-	Apps   map[string]App
-	Roots  []string
-	Cgroup string
+	Apps      map[string]App
+	Roots     []string
+	Cgroup    string
+	Resources ResourceLimits
 }
 
 // Load validates the whole snapshot before it can replace running services.
@@ -198,14 +295,17 @@ func Load(path string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	var main Config
+	main := Config{Resources: ResourceLimits{MaxCPUPercent: 90, MinAvailableMemoryPercent: 10}}
 	if err := read(path, &main); err != nil {
 		return Snapshot{}, err
 	}
 	if len(main.Watch) == 0 {
 		return Snapshot{}, fmt.Errorf("%s: watch must contain at least one glob", path)
 	}
-	result := Snapshot{Apps: make(map[string]App), Roots: []string{filepath.Dir(path)}}
+	if main.Resources.MaxCPUPercent < 0 || main.Resources.MaxCPUPercent > 100 || main.Resources.MinAvailableMemoryPercent < 0 || main.Resources.MinAvailableMemoryPercent > 100 {
+		return Snapshot{}, fmt.Errorf("resource percentages must be between 0 and 100; zero disables a limit")
+	}
+	result := Snapshot{Apps: make(map[string]App), Roots: []string{filepath.Dir(path)}, Resources: main.Resources}
 	if main.Cgroup != "" {
 		result.Cgroup = resolve(filepath.Dir(path), main.Cgroup)
 	}
@@ -243,10 +343,19 @@ func Load(path string) (Snapshot, error) {
 			app := App{
 				MaxWorkers: 1, Concurrency: 1, IdleTimeout: time.Minute,
 				StartTimeout: 10 * time.Second, StopTimeout: 10 * time.Second,
-				ScaleDelay: 100 * time.Millisecond,
+				ScaleAt: 80,
 			}
 			if err := read(file, &app); err != nil {
 				return Snapshot{}, err
+			}
+			if app.ScaleWindow != 0 && app.ScaleDelay != 0 {
+				return Snapshot{}, fmt.Errorf("%s: use scale_window or the legacy scale_delay, not both", file)
+			}
+			if app.ScaleWindow == 0 {
+				app.ScaleWindow = app.ScaleDelay
+				if app.ScaleWindow == 0 {
+					app.ScaleWindow = time.Second
+				}
 			}
 			app.Source = file
 			if app.Name == "" {
@@ -365,8 +474,11 @@ func (app App) validate() error {
 	if app.MinWorkers < 0 || app.MaxWorkers < 1 || app.MinWorkers > app.MaxWorkers || app.Concurrency < 1 {
 		return fmt.Errorf("require 0 <= min_workers <= max_workers and positive max_workers/concurrency")
 	}
-	if app.IdleTimeout <= 0 || app.StartTimeout <= 0 || app.StopTimeout <= 0 || app.ScaleDelay <= 0 || app.RequestTimeout < 0 {
-		return fmt.Errorf("timeouts and scale_delay must be positive; request_timeout may be zero")
+	if app.IdleTimeout <= 0 || app.StartTimeout <= 0 || app.StopTimeout <= 0 || app.ScaleWindow <= 0 || app.ScaleDelay < 0 || app.RequestTimeout < 0 {
+		return fmt.Errorf("timeouts and scale_window must be positive; request_timeout may be zero")
+	}
+	if app.ScaleAt <= 0 || app.ScaleAt > 100 {
+		return fmt.Errorf("scale_at must be greater than 0 and at most 100")
 	}
 	for key, value := range app.Env {
 		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, 0) || strings.HasPrefix(key, "OOTH_") {
@@ -733,7 +845,6 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	}
 	manager.workers[child] = struct{}{}
 	service.workers[child] = struct{}{}
-	service.lastSpawn = now
 	service.demand = false
 	manager.log.Info("worker started", "app", service.name, "pid", cmd.Process.Pid)
 	scanned := make(chan struct{})
@@ -805,25 +916,70 @@ type service struct {
 	listener      *serviceListener
 	workers       map[*process]struct{}
 	demand        bool
-	lastSpawn     time.Time
-	busySince     time.Time
+	pressure      pressureWindow
 	retryAt       time.Time
 	failures      int
 	unneededSince time.Time
 }
 
+// Integrate occupancy at every telemetry transition, including short requests
+// that start and finish between scheduler ticks. Capacity changes reset it.
+type pressureWindow struct {
+	since, last time.Time
+	value, area float64
+	workers     int
+}
+
+func (service *service) observePressure(now time.Time) {
+	count, active := 0, 0
+	for child := range service.workers {
+		if !child.stopping.IsZero() {
+			continue
+		}
+		if !child.ready || !child.telemetry {
+			service.pressure = pressureWindow{}
+			return
+		}
+		count++
+		active += min(len(child.active), service.config.Concurrency)
+	}
+	if count == 0 {
+		service.pressure = pressureWindow{}
+		return
+	}
+	pressure := &service.pressure
+	if pressure.since.IsZero() || pressure.workers != count {
+		*pressure = pressureWindow{since: now, last: now, workers: count}
+	}
+	pressure.area += pressure.value * now.Sub(pressure.last).Seconds()
+	pressure.last = now
+	pressure.value = float64(active) / float64(count*service.config.Concurrency)
+}
+
+func (pressure *pressureWindow) evaluate(now time.Time, window time.Duration, threshold Percent) bool {
+	if pressure.since.IsZero() || now.Sub(pressure.since) < window {
+		return false
+	}
+	average := 100 * pressure.area / now.Sub(pressure.since).Seconds()
+	pressure.since, pressure.area = now, 0
+	return average >= float64(threshold)
+}
+
 type manager struct {
-	owner        *processOwner
-	cgroup       string
-	services     map[string]*service
-	workers      map[*process]struct{}
-	messages     chan message
-	log          *slog.Logger
-	done         chan struct{}
-	fatal        error
-	poller       *Poller
-	listeners    map[int32]*service
-	nextListener int32
+	owner          *processOwner
+	cgroup         string
+	services       map[string]*service
+	workers        map[*process]struct{}
+	messages       chan message
+	log            *slog.Logger
+	done           chan struct{}
+	fatal          error
+	poller         *Poller
+	listeners      map[int32]*service
+	nextListener   int32
+	resourceLimits ResourceLimits
+	resources      resourceSample
+	resourceBlock  string
 }
 
 func Run(ctx context.Context, path string, logger *slog.Logger) error {
@@ -850,6 +1006,11 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	if err := manager.apply(initial); err != nil {
 		return err
 	}
+	resourceContext, cancelResources := context.WithCancel(ctx)
+	samples := make(chan resourceSample)
+	resourcesDone := make(chan struct{})
+	go func() { defer close(resourcesDone); sampleResources(resourceContext, owner, samples) }()
+	defer func() { cancelResources(); <-resourcesDone }()
 	pollDone := make(chan struct{})
 	go func() { defer close(pollDone); manager.watchListeners() }()
 	defer func() {
@@ -882,6 +1043,12 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 			return result
 		}
 		select {
+		case sample := <-samples:
+			if sample.err != nil && manager.resources.err == nil {
+				logger.Warn("resource measurements unavailable; extra worker growth deferred", "error", sample.err)
+			}
+			manager.resources = sample
+			logger.Debug("system resources", "cpu_percent", sample.cpu, "available_memory_percent", sample.availableMemory, "error", sample.err)
 		case <-done:
 			done = nil
 			stopping = true
@@ -908,7 +1075,8 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 			}
 		case msg := <-manager.messages:
 			manager.handle(msg, time.Now())
-		case now := <-ticker.C:
+		case <-ticker.C:
+			now := time.Now()
 			if pending != nil && !stopping && !now.Before(retryConfig) {
 				if manager.apply(*pending) == nil {
 					pending = nil
@@ -1020,6 +1188,7 @@ func (manager *manager) apply(snapshot Snapshot) error {
 		}
 		manager.log.Info("service configured", "app", name, "network", app.Listen.Network, "address", app.Listen.Address)
 	}
+	manager.resourceLimits = snapshot.Resources
 	committed = true
 	return nil
 }
@@ -1069,6 +1238,7 @@ func (manager *manager) shutdown() {
 }
 
 func (manager *manager) stop(child *process, now time.Time, reason string) {
+	defer child.service.observePressure(now)
 	if !child.stopping.IsZero() {
 		return
 	}
@@ -1105,6 +1275,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		return
 	}
 	service := child.service
+	defer service.observePressure(now)
 	if msg.exited {
 		if msg.cleanupErr != nil {
 			manager.fatal = fmt.Errorf("clean up worker %d descendants: %w", child.cmd.Process.Pid, msg.cleanupErr)
@@ -1255,6 +1426,15 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		}
 		return
 	}
+	blocked := manager.resourceLimits.blocked(manager.resources, now)
+	if blocked != manager.resourceBlock {
+		manager.resourceBlock = blocked
+		if blocked != "" {
+			manager.log.Info("extra worker growth paused", "reason", blocked)
+		} else {
+			manager.log.Info("extra worker growth allowed")
+		}
+	}
 	// A virtual activation holds dependencies while a caller is starting or
 	// running. Shared prerequisites start once; independent branches run together.
 	wanted := make(map[string]bool)
@@ -1303,7 +1483,9 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			}
 			continue
 		}
-		available, starting, busy := 0, 0, 0
+		service.observePressure(now)
+		pressureGrowth := service.pressure.evaluate(now, app.ScaleWindow, app.ScaleAt)
+		available, starting := 0, 0
 		for child := range service.workers {
 			if !child.stopping.IsZero() {
 				continue
@@ -1311,27 +1493,19 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			available++
 			if !child.ready {
 				starting++
-			} else if child.telemetry && len(child.active) >= app.Concurrency {
-				busy++
 			}
-		}
-		if available > 0 && busy == available {
-			if service.busySince.IsZero() {
-				service.busySince = now
-			}
-		} else {
-			service.busySince = time.Time{}
 		}
 		grow := available < app.MinWorkers || (available == 0 && service.demand)
 		if available == 0 && (app.Startup || required[service.name]) {
 			grow = true
 		}
-		grow = grow || (!service.busySince.IsZero() && now.Sub(service.busySince) >= app.ScaleDelay)
-		if grow && starting == 0 && len(service.workers) < app.MaxWorkers && !now.Before(service.retryAt) && now.Sub(service.lastSpawn) >= app.ScaleDelay {
+		grow = grow || (blocked == "" && pressureGrowth)
+		if grow && starting == 0 && len(service.workers) < app.MaxWorkers && !now.Before(service.retryAt) {
 			if err := manager.spawn(service, now); err != nil {
 				service.backoff(now)
 				manager.log.Error("worker start failed", "app", service.name, "error", err)
 			}
+			service.observePressure(now)
 		}
 		if available > 0 {
 			service.demand = false

@@ -10,12 +10,170 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 )
+
+// Read every visible ancestor: a sibling may exhaust a parent's budget even
+// while this supervisor's own subtree is mostly idle.
+func (owner *processOwner) resourceGroups() (map[string]resourceGroup, error) {
+	membership, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil, err
+	}
+	mounts, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	paths := resourceGroupPaths(string(membership), string(mounts), owner.root)
+	groups := make(map[string]resourceGroup)
+	for _, path := range paths {
+		group, err := readResourceGroup(path)
+		if err != nil {
+			return nil, fmt.Errorf("resource cgroup %s: %w", path, err)
+		}
+		groups[path] = group
+	}
+	return groups, nil
+}
+
+func resourceGroupPaths(membership, mounts, workerRoot string) []string {
+	var current string
+	for _, line := range strings.Split(membership, "\n") {
+		if name, ok := strings.CutPrefix(line, "0::"); ok {
+			current = name
+		}
+	}
+	var paths []string
+	unescape := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	for _, line := range strings.Split(mounts, "\n") {
+		before, _, ok := strings.Cut(line, " - cgroup2 ")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(before)
+		mountRoot, mountPoint := unescape.Replace(fields[3]), unescape.Replace(fields[4])
+		var roots []string
+		if relative, err := filepath.Rel(mountRoot, current); current != "" && err == nil && relative != ".." && !strings.HasPrefix(relative, "../") {
+			roots = append(roots, filepath.Join(mountPoint, relative))
+		}
+		if relative, err := filepath.Rel(mountPoint, workerRoot); workerRoot != "" && err == nil && relative != ".." && !strings.HasPrefix(relative, "../") {
+			roots = append(roots, workerRoot)
+		}
+		for _, root := range roots {
+			for path := root; ; path = filepath.Dir(path) {
+				if !slices.Contains(paths, path) {
+					paths = append(paths, path)
+				}
+				if path == mountPoint {
+					break
+				}
+			}
+		}
+	}
+	return paths
+}
+
+func readResourceGroup(path string) (resourceGroup, error) {
+	group := resourceGroup{availableMemory: 100}
+	read := func(name string) (string, error) {
+		data, err := os.ReadFile(filepath.Join(path, name))
+		if os.IsNotExist(err) {
+			return "", nil
+		} // Controller not enabled here.
+		return strings.TrimSpace(string(data)), err
+	}
+	quota, err := read("cpu.max")
+	if err != nil {
+		return group, err
+	}
+	if quota != "" {
+		fields := strings.Fields(quota)
+		if len(fields) != 2 {
+			return group, fmt.Errorf("invalid cpu.max")
+		}
+		if fields[0] != "max" {
+			budget, budgetErr := strconv.ParseFloat(fields[0], 64)
+			period, periodErr := strconv.ParseFloat(fields[1], 64)
+			if budgetErr != nil || periodErr != nil || budget <= 0 || period <= 0 {
+				return group, fmt.Errorf("invalid cpu.max quota")
+			}
+			group.cores = budget / period
+		}
+	}
+	cpuset, err := read("cpuset.cpus.effective")
+	if err != nil {
+		return group, err
+	}
+	if cpuset != "" {
+		count := 0
+		for _, part := range strings.Split(cpuset, ",") {
+			first, last, span := strings.Cut(part, "-")
+			low, err := strconv.Atoi(first)
+			if err != nil {
+				return group, err
+			}
+			high := low
+			if span {
+				high, err = strconv.Atoi(last)
+			}
+			if err != nil || high < low {
+				return group, fmt.Errorf("invalid cpuset range")
+			}
+			count += high - low + 1
+		}
+		if group.cores == 0 || float64(count) < group.cores {
+			group.cores = float64(count)
+		}
+	}
+	if group.cores > 0 {
+		data, err := read("cpu.stat")
+		if err != nil {
+			return group, err
+		}
+		found := false
+		for _, line := range strings.Split(data, "\n") {
+			if value, ok := strings.CutPrefix(line, "usage_usec "); ok {
+				usage, err := strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					return group, err
+				}
+				group.cpuSeconds = float64(usage) / 1e6
+				found = true
+			}
+		}
+		if !found {
+			return group, fmt.Errorf("cpu.stat missing usage_usec")
+		}
+	}
+	limit, err := read("memory.max")
+	if err != nil {
+		return group, err
+	}
+	if limit != "" && limit != "max" {
+		maximum, err := strconv.ParseUint(limit, 10, 64)
+		if err != nil {
+			return group, err
+		}
+		value, err := read("memory.current")
+		if err != nil {
+			return group, err
+		}
+		used, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return group, err
+		}
+		group.availableMemory = 0
+		if maximum > used {
+			group.availableMemory = 100 * float64(maximum-used) / float64(maximum)
+		}
+	}
+	return group, nil
+}
 
 func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
 	credential, err := identity.credentials()

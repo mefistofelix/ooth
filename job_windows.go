@@ -170,6 +170,8 @@ func (identity Identity) socket(path string, _ os.FileMode) (func(bool) error, e
 
 type processOwner struct{}
 
+func (*processOwner) resourceGroups() (map[string]resourceGroup, error) { return nil, nil }
+
 func newProcessOwner(_ string, _ *slog.Logger) (*processOwner, error) {
 	return &processOwner{}, nil
 }

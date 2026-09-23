@@ -330,7 +330,7 @@ func runPressure(t *testing.T, root string, scenario pressureCase) {
 		clientAddress = pressureProxy(t, directory, address, scenario.Proxy)
 	}
 	config := filepath.Join(directory, "ooth.yaml")
-	write(t, config, "watch: ['apps/*.yaml']\n")
+	write(t, config, "watch: ['apps/*.yaml']\n"+unlimitedTestResources)
 	log := &pressureLog{}
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan error, 1)

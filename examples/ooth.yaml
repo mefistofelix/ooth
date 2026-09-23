@@ -1,2 +1,5 @@
 watch:
   - app*/ooth.yaml
+resources:
+  max_cpu_percent: 90
+  min_available_memory_percent: 10

@@ -56,3 +56,5 @@ python3 tools/probes/pressure/analyze.py build/pressure-linux --platform linux -
 ```
 
 Use a writable delegated cgroup for whole-family supervision on Linux, as described in `../proxy/README.md` and implemented by `../with-cgroup.sh`. The ordinary build skips these opt-in experiments. No GitHub workflow is dispatched. Raw local artifacts belong under ignored `build/`; portable aggregate CSVs and the interpretation belong here.
+
+The committed CSV/RESULTS data describes the earlier policy at `40807dd`. Reruns now use mean occupancy (`scale_at: 80%`, legacy `scale_delay` mapped to `scale_window`); global CPU/RAM gating is explicitly disabled to isolate worker pressure. Do not present old CSVs as validation of the new policy.
