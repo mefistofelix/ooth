@@ -19,7 +19,7 @@ On Windows use Git Bash to build, then run `bin/ooth-windows-amd64.exe`. Set the
 
 The script downloads and verifies **Go 1.27.1**, patches its dedicated copy under `build/`, runs tests and `go vet`, then builds amd64 and arm64 binaries for the host OS. It never patches an existing Go installation. When the patch changes, affected source files are restored from the verified archive before applying it. The Go version is deliberately pinned: toolchain changes must be reviewed when upgrading Go. A stock `go build` is not supported.
 
-`-version` prints the commit/build version; `-debug` includes completed request metrics. Development changes are tested locally; pushes do not trigger GitHub builds. Run the workflow manually at agreed milestones to verify Linux and Windows on clean runners. Enable `publish_release` when that run should also publish a prerelease containing the four binaries and `SHA256SUMS`; otherwise it only builds/tests and uploads workflow artifacts. ARM64 is cross-compiled, while integration tests run on amd64.
+`-version` prints the commit/build version; `-debug` includes request start/finish metrics and listener observations with their poll-return timestamps. Development changes are tested locally; pushes do not trigger GitHub builds. Run the workflow manually at agreed milestones to verify Linux and Windows on clean runners. Enable `publish_release` when that run should also publish a prerelease containing the four binaries and `SHA256SUMS`; otherwise it only builds/tests and uploads workflow artifacts. ARM64 is cross-compiled, while integration tests run on amd64.
 
 ## Configuration
 
@@ -178,6 +178,8 @@ The implementation is in [`tools/patchgo/patches/epoll_windows.txt`](tools/patch
 `epoll_test.go` exercises readiness without consuming traffic, one-shot rearming, level triggering, pending MOD/DEL/re-add, shutdown cancellation, connection writability/half-close and 128 idle listeners without per-socket goroutine growth. Run `go test -run '^$' -bench BenchmarkEpollIdleListeners -benchmem .` with the dedicated compiler for an idle-queue microbenchmark; it is not an application-throughput comparison.
 
 ## Development status
+
+The opt-in [pressure experiments](tools/probes/pressure/README.md) compare listener notifications, accept observations, request activity and client latency under open-loop load. They include Go/Python/Node/PHP, fixed and growing pools, and Caddy/Nginx upstreams. Generated configurations and raw CSV traces stay under `build/`; the fixtures, analyzer and aggregate results are versioned. These measurements do not change the scaling policy or add events to the worker protocol.
 
 The [Caddy/Nginx suite](tools/probes/proxy/README.md) starts each real webserver through ooth's init mode and tests Python/HTTP, Node/h2c and stock PHP/FastCGI. It passed on Linux and Windows, using the documented PHP launcher on Windows. Python/Node checks cover cold activation, two worker PIDs, start/end telemetry, return to zero after TTL and reactivation; PHP stays at one ordinary worker without telemetry. All worker sources, configuration templates, runtime preparation scripts and test code are committed; downloaded runtimes and generated logs stay under ignored `build/`. This suite fixed a regression where idle workers being stopped could inadvertently trigger replacements.
 

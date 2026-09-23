@@ -675,6 +675,7 @@ type message struct {
 	process    *process
 	sockets    []syscall.EpollEvent
 	poll       bool
+	observed   time.Time
 	event      Event
 	exited     bool
 	probe      bool
@@ -1027,6 +1028,7 @@ func (manager *manager) watchListeners() {
 	events := make([]syscall.EpollEvent, 64)
 	for {
 		count, err := syscall.EpollWait(manager.poller.fd, events, -1)
+		observed := time.Now()
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
@@ -1041,7 +1043,7 @@ func (manager *manager) watchListeners() {
 		select {
 		case <-manager.done:
 			return
-		case manager.messages <- message{poll: true, sockets: slices.Clone(events[:count]), err: err}:
+		case manager.messages <- message{poll: true, observed: observed, sockets: slices.Clone(events[:count]), err: err}:
 		}
 		if err != nil {
 			return
@@ -1093,6 +1095,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 				continue
 			}
 			service.demand = true
+			manager.log.Debug("listener readable", "app", service.name, "observed_ns", msg.observed.UnixNano())
 			service.listener.rearmAt = now.Add(25 * time.Millisecond)
 		}
 		return
