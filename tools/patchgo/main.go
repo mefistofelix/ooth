@@ -26,15 +26,24 @@ func main() {
 	if strings.Split(string(version), "\n")[0] != "go1.27.1" {
 		fail(fmt.Errorf("patch requires Go 1.27.1"))
 	}
-	replace(*root, "src/internal/poll/fd_windows.go", "\terr := fd.pd.init(fd)\n", `	// ooth: shared listening sockets must not belong to one process's IOCP.
-	if listening, _ := syscall.GetsockoptInt(fd.Sysfd, syscall.SOL_SOCKET, 2); fd.kind == kindNet && listening != 0 {
-		serverInit.Do(runtime_pollServerInit)
+	replace(*root, "src/internal/poll/fd_windows.go", "\terr := fd.pd.init(fd)\n\tif err != nil {\n\t\treturn err\n\t}\n", `	err := fd.pd.init(fd)
+	if err != nil {
+		// ooth: like libuv's imported-socket fallback, retain normal IOCP
+		// unless a shared listener cannot join this process's completion port.
+		if err != windows.ERROR_INVALID_PARAMETER || fd.kind != kindNet {
+			return err
+		}
+		listening, socketErr := syscall.GetsockoptInt(fd.Sysfd, syscall.SOL_SOCKET, 2)
+		if socketErr != nil || listening == 0 {
+			return err
+		}
 		ctx, errno := runtime_pollOpen(uintptr(syscall.InvalidHandle))
-		if errno != 0 { return syscall.Errno(errno) }
+		if errno != 0 {
+			return syscall.Errno(errno)
+		}
 		fd.pd.runtimeCtx = ctx
 		return nil
 	}
-	err := fd.pd.init(fd)
 `)
 	replace(*root, "src/runtime/netpoll_windows.go", "func netpollopen(fd uintptr, pd *pollDesc) int32 {\n", `func netpollopen(fd uintptr, pd *pollDesc) int32 {
 	// ooth: deadline/close tracking for a listener shared between processes.
