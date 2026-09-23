@@ -130,3 +130,111 @@ func TestTrueAsyncCompatibility(t *testing.T) {
 		}
 	})
 }
+
+// An extra native handle avoids initializing the listener as stdin. Windows
+// additionally exercises a private FFI hook into the real HTTP server. Linux's
+// release lacks FFI, so its proof is explicitly limited to async socket_accept.
+func TestTrueAsyncExtraHandle(t *testing.T) {
+	php := os.Getenv("OOTH_TEST_TRUEASYNC")
+	if php == "" {
+		t.Skip("set OOTH_TEST_TRUEASYNC to the portable TrueAsync 0.10.0 PHP executable")
+	}
+	php, err := filepath.Abs(php)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-n", "-d", "display_errors=stderr"}
+	script := "socket.php"
+	if runtime.GOOS == "windows" {
+		args = append(args, "-d", "extension_dir="+filepath.Join(filepath.Dir(php), "ext"), "-d", "extension=php_true_async_server.dll", "-d", "extension=php_ffi.dll", "-d", "ffi.enable=1")
+		script = "ffi-server-windows.php"
+	}
+	args = append(args, filepath.Join("tools", "probes", "trueasync", script))
+	listener, err := OpenListener("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for index := 0; index < 3; index++ {
+		cmd := exec.CommandContext(ctx, php, args...)
+		cmd.Stdin = strings.NewReader("ordinary stdin\n")
+		handle, release := extraTestHandle(t, cmd, listener.File)
+		cmd.Env = append(os.Environ(), "OOTH_LISTEN_HANDLE="+handle)
+		var diagnostic bytes.Buffer
+		cmd.Stderr = &diagnostic
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		err = cmd.Start()
+		release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			cmd.Process.Kill()
+			cmd.Wait()
+			if t.Failed() {
+				t.Log(diagnostic.String())
+			}
+		}()
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		if err != nil || line != "ready\n" {
+			t.Fatalf("ready=%q error=%v", line, err)
+		}
+		// Keep earlier workers alive: verify each new one can adopt the same
+		// socket, not just that one process can adopt a fresh listener.
+		protocols := []bool{false}
+		if runtime.GOOS == "windows" {
+			protocols = append(protocols, true)
+		}
+		for _, h2 := range protocols {
+			served := false
+			for attempt := 0; attempt < 80 && !served; attempt++ {
+				var body string
+				if runtime.GOOS == "windows" {
+					body = trueAsyncHTTPReply(t, listener.Addr().String(), h2)
+				} else {
+					connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					connection.SetDeadline(time.Now().Add(time.Second))
+					body, err = bufio.NewReader(connection).ReadString('\n')
+					connection.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				served = body == fmt.Sprintln(cmd.Process.Pid)
+			}
+			if !served {
+				t.Fatalf("worker %d never served a request (h2=%v)", cmd.Process.Pid, h2)
+			}
+			t.Logf("worker=%d extra=%s ordinary stdin/stdout/stderr intact, h2=%v", cmd.Process.Pid, handle, h2)
+		}
+	}
+}
+
+func trueAsyncHTTPReply(t *testing.T, address string, h2 bool) string {
+	t.Helper()
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(!h2)
+	protocols.SetUnencryptedHTTP2(h2)
+	transport := &http.Transport{Protocols: protocols}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	response, err := client.Get("http://" + address + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != 200 || (response.ProtoMajor == 2) != h2 {
+		t.Fatalf("protocol=%s status=%d error=%v", response.Proto, response.StatusCode, err)
+	}
+	return string(body)
+}

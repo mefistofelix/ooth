@@ -2,11 +2,15 @@
 // Low-level adoption probe, not the built-in HTTP server adapter.
 fwrite(STDERR, "script started\n");
 // fd 0 hits a TrueAsync 0.10.0 poller bug on Linux. This wrapper duplicates
-// stdin before sockets adopts it; the listener remains the same kernel socket.
-$input = fopen('php://fd/0', 'r+');
+// the input descriptor; the listener remains the same kernel socket.
+$descriptor = getenv('OOTH_LISTEN_HANDLE');
+if ($descriptor !== false && fgets(STDIN) !== "ordinary stdin\n") {
+    throw new RuntimeException('Ordinary stdin is not usable');
+}
+$input = fopen('php://fd/' . ($descriptor === false ? '0' : $descriptor), 'r+');
 $listener = socket_import_stream($input);
 if ($listener === false) {
-    throw new RuntimeException('Cannot adopt stdin');
+    throw new RuntimeException('Cannot adopt inherited listener');
 }
 echo "ready\n";
 Async\await(Async\spawn(function () use ($listener) {

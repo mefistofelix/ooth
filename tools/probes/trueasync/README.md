@@ -19,6 +19,7 @@ Windows, after building ooth:
 $env:CGO_ENABLED = '0'
 $env:OOTH_TEST_TRUEASYNC = "$PWD/build/runtime-trueasync/windows/php.exe"
 ./build/windows-amd64/go/bin/go.exe test -v -run '^TestTrueAsyncCompatibility$' .
+./build/windows-amd64/go/bin/go.exe test -v -run '^TestTrueAsyncExtraHandle$' .
 ```
 
 Linux:
@@ -27,6 +28,8 @@ Linux:
 bash tools/probes/trueasync/prepare-linux.sh
 CGO_ENABLED=0 OOTH_TEST_TRUEASYNC="$PWD/build/runtime-trueasync/linux/php-trueasync-0.10.0-php8.6-linux-x86_64/php" \
   ./build/linux-amd64/go/bin/go test -v -run '^TestTrueAsyncCompatibility$' .
+CGO_ENABLED=0 OOTH_TEST_TRUEASYNC="$PWD/build/runtime-trueasync/linux/php-trueasync-0.10.0-php8.6-linux-x86_64/php" \
+  ./build/linux-amd64/go/bin/go test -v -run '^TestTrueAsyncExtraHandle$' .
 ```
 
 `TestTrueAsyncCompatibility` is opt-in. Its Windows adoption case deliberately
@@ -44,6 +47,7 @@ Verified on Windows amd64 and Linux amd64/WSL2:
 | Built-in server, own listener, h2c prior knowledge | HTTP/2 200 response | HTTP/2 200 response |
 | Imported stdin duplicate, coroutine `socket_accept` | Three connections served | Fails before PHP script runs |
 | Built-in server adopting ooth listener | No public adoption entry point found | Same missing API, plus stdin startup failure |
+| Extra handle, ordinary stdin, three worker processes | Async accept succeeds on fd 3 | Native HTTP/1.1 and h2c succeed via private FFI hook |
 
 `socket.php` is a low-level diagnostic using the runtime's socket extension and
 coroutines, **not** a replacement HTTP implementation. `server.php` exercises
@@ -51,6 +55,55 @@ the real native HTTP server on its own control listener, without activation.
 The test parent passes stdin using ooth's `OpenListener`; it never accepts or
 forwards the application traffic. Children are forcefully cleaned up by this
 bounded diagnostic; graceful draining has not yet been certified for TrueAsync.
+
+## Extra handle and FFI workaround
+
+The user proposed keeping stdin/stdout/stderr available and passing the listener
+separately. `TestTrueAsyncExtraHandle` proves this with ooth's `OpenListener` and
+three simultaneously running PHP processes. Every child reads an ordinary line
+from stdin, writes readiness on stdout and diagnostics on stderr, and must serve
+its own PID through the inherited listener. The parent never accepts or forwards
+traffic. This experiment does not change the production stdin convention.
+
+Existing Go APIs provide the inheritance, without another toolchain patch:
+
+- Linux: `Cmd.ExtraFiles[0]` becomes descriptor **3**, the fourth descriptor after
+  0/1/2. Descriptor 4 would be the fifth slot.
+- Windows: an inheritable duplicate goes in `SysProcAttr.AdditionalInheritedHandles`.
+  The child receives the native handle with that value; Go does not create a
+  Windows CRT descriptor numbered 3. The parent's duplicate closes after Start.
+- The experimental `OOTH_LISTEN_HANDLE` environment variable conveys the actual
+  value. A portable convention can share this variable, but cannot promise the
+  same fixed numeric descriptor on both operating systems.
+
+On Windows, the distributed `php_ffi.dll` is enabled with `ffi.enable=1`.
+`ffi-server-windows.php` temporarily replaces the exported function pointer
+`zend_async_socket_listen_fd_fn` with a PHP FFI callback, saves its original value,
+and restores it immediately when called. The callback gives the inherited socket
+to the original native adoption function. The real built-in HTTP server then
+handles accept, HTTP/1.1, h2c and the coroutine handler. Each of three live workers
+has returned its PID over both HTTP versions in local tests.
+
+This **private ABI workaround has limits**:
+
+- It is restricted to the tested Windows 0.10.0 runtime, one configured listener
+  and `setWorkers(1)` per process; it is not a public PHP adoption API.
+- Before the hook runs, the native server binds an unused temporary loopback
+  listener on port 0. The hook closes its adoption duplicate and substitutes the
+  inherited handle; the original temporary listener stays owned by the server.
+  Actual test requests use only ooth's listener, but this is not a bind-free adapter.
+- The reactor takes ownership of the child's inherited socket. The supervisor
+  retains its separate handle. The function-pointer callback must remain alive
+  during the call, and the saved pointer must be a value copy, not a reference.
+- Linux's official binary does not include FFI. Its extra-handle test uses
+  `socket.php` and async `socket_accept`, not the built-in HTTP server. No alternative
+  extension or interpreter build has been installed.
+- Request telemetry, graceful draining, autoscaling and proxy-stack integration
+  are not covered by this workaround. Cleanup is forceful and bounded by the test.
+
+The result establishes that a released Windows binary can adopt the listener
+without recompilation and that an additional handle avoids the stdin startup
+failure. A public native-server adoption method remains the clean implementation.
 
 ### Linux fd zero
 

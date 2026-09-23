@@ -8,7 +8,7 @@ This is an experimental nucleus, not a replacement for all of systemd. It superv
 
 ## Build and run
 
-The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. Its integration with an inherited activation listener is still blocked by a missing public native-server adoption API and a Windows stdin initialization issue; those control tests are not a working ooth HTTP worker adapter.
+The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. An additional inherited handle keeps stdin usable on both OSes. A Windows-only experimental FFI hook now connects three native HTTP/1.1/h2c servers to the same inherited listener without recompiling PHP. It uses a private ABI and creates an unused temporary listener; it is not a production worker adapter. The Linux release lacks FFI, so its additional-handle test covers async accept only. The production worker convention remains stdin.
 
 ```sh
 bash ./build.sh
