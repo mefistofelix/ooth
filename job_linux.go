@@ -17,14 +17,14 @@ import (
 )
 
 type processOwner struct {
-	mu                sync.Mutex
-	root              string
-	managed           map[int]*exec.Cmd
-	log               *slog.Logger
-	signals           chan os.Signal
-	done              chan struct{}
-	previousSubreaper int32
-	groupUnavailable  bool
+	mu               sync.Mutex
+	root             string
+	managed          map[int]*exec.Cmd
+	log              *slog.Logger
+	signals          chan os.Signal
+	done             chan struct{}
+	resetSubreaper   bool
+	groupUnavailable bool
 }
 
 func newProcessOwner(root string, logger *slog.Logger) (*processOwner, error) {
@@ -60,20 +60,24 @@ func newProcessOwner(root string, logger *slog.Logger) (*processOwner, error) {
 			os.Remove(owner.root)
 			owner.root = ""
 		}
-		logger.Warn("descendant supervision disabled; monitoring direct children only", "error", err)
+		logger.Warn("descendant supervision disabled; group termination unavailable", "error", err)
 	}
-	if owner.root != "" {
-		// PR_SET_CHILD_SUBREAPER: cgroups keep membership; this adopts orphans.
-		if _, _, err := syscall.Syscall6(syscall.SYS_PRCTL, 37, uintptr(unsafe.Pointer(&owner.previousSubreaper)), 0, 0, 0, 0); err != 0 {
-			os.Remove(owner.root)
-			return nil, fmt.Errorf("read child subreaper: %w", err)
+	// PID 1 already adopts orphans. Other supervisors opt into that role even
+	// without cgroups: adoption and service membership are independent.
+	reaping := os.Getpid() == 1
+	if !reaping {
+		var previous int32
+		_, _, err := syscall.Syscall6(syscall.SYS_PRCTL, 37, uintptr(unsafe.Pointer(&previous)), 0, 0, 0, 0) // PR_GET_CHILD_SUBREAPER
+		if err == 0 && previous == 0 {
+			_, _, err = syscall.Syscall6(syscall.SYS_PRCTL, 36, 1, 0, 0, 0, 0) // PR_SET_CHILD_SUBREAPER
+			owner.resetSubreaper = err == 0
 		}
-		if _, _, err := syscall.Syscall6(syscall.SYS_PRCTL, 36, 1, 0, 0, 0, 0); err != 0 {
-			os.Remove(owner.root)
-			return nil, fmt.Errorf("enable child subreaper: %w", err)
+		reaping = err == 0
+		if err != 0 {
+			logger.Warn("orphan adoption unavailable; direct worker exits are still monitored", "error", err)
 		}
 	}
-	if owner.root != "" || os.Getpid() == 1 {
+	if reaping {
 		owner.signals = make(chan os.Signal, 1)
 		owner.done = make(chan struct{})
 		signal.Notify(owner.signals, syscall.SIGCHLD)
@@ -155,7 +159,9 @@ func (owner *processOwner) Close() {
 		if err := os.Remove(owner.root); err != nil {
 			owner.log.Error("remove supervisor cgroup", "error", err)
 		}
-		if _, _, err := syscall.Syscall6(syscall.SYS_PRCTL, 36, uintptr(owner.previousSubreaper), 0, 0, 0, 0); err != 0 {
+	}
+	if owner.resetSubreaper {
+		if _, _, err := syscall.Syscall6(syscall.SYS_PRCTL, 36, 0, 0, 0, 0, 0); err != 0 {
 			owner.log.Error("restore child subreaper", "error", err)
 		}
 	}
