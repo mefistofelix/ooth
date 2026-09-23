@@ -68,6 +68,23 @@ func main() {
 		return signalConsoleGroup(p.Pid)
 	}
 	if sig == Kill {`)
+	replace(*root, "src/syscall/exec_windows.go", "type SysProcAttr struct {\n", `type SysProcAttr struct {
+	// JobObjects assigns the child to these jobs during creation, before it runs.
+	// Requires Windows 10 / Server 2016. Added by the ooth toolchain patch.
+	JobObjects []Handle
+`)
+	replace(*root, "src/syscall/exec_windows.go",
+		"procAttrList, err := newProcThreadAttributeList(2)",
+		"procAttrList, err := newProcThreadAttributeList(3)")
+	replace(*root, "src/syscall/exec_windows.go", "\tsi.StdInput = fd[0]\n", `	if len(sys.JobObjects) > 0 {
+		const procThreadAttributeJobList = 0x0002000D
+		err = procAttrList.update(procThreadAttributeJobList, unsafe.Pointer(&sys.JobObjects[0]), uintptr(len(sys.JobObjects))*unsafe.Sizeof(sys.JobObjects[0]))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	si.StdInput = fd[0]
+`)
 	for template, target := range map[string]string{
 		"epoll_linux.txt":   "src/syscall/ooth_epoll_linux.go",
 		"epoll_windows.txt": "src/syscall/ooth_epoll_windows.go",

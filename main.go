@@ -64,7 +64,8 @@ func main() {
 }
 
 type Config struct {
-	Watch []string `yaml:"watch"`
+	Watch  []string `yaml:"watch"`
+	Cgroup string   `yaml:"cgroup"`
 }
 
 type Socket struct {
@@ -93,8 +94,9 @@ type App struct {
 }
 
 type Snapshot struct {
-	Apps  map[string]App
-	Roots []string
+	Apps   map[string]App
+	Roots  []string
+	Cgroup string
 }
 
 // Load validates the whole snapshot before it can replace running services.
@@ -112,6 +114,9 @@ func Load(path string) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("%s: watch must contain at least one glob", path)
 	}
 	result := Snapshot{Apps: make(map[string]App), Roots: []string{filepath.Dir(path)}}
+	if main.Cgroup != "" {
+		result.Cgroup = resolve(filepath.Dir(path), main.Cgroup)
+	}
 	sockets := make(map[Socket]string)
 	for _, pattern := range main.Watch {
 		pattern = resolve(filepath.Dir(path), pattern)
@@ -549,6 +554,7 @@ func (poller *Poller) Close() error {
 
 type process struct {
 	cmd       *exec.Cmd
+	job       *processJob
 	service   *service
 	ready     bool
 	active    map[string]time.Time
@@ -563,14 +569,15 @@ type process struct {
 }
 
 type message struct {
-	process *process
-	sockets []syscall.EpollEvent
-	poll    bool
-	event   Event
-	exited  bool
-	probe   bool
-	ready   bool
-	err     error
+	process    *process
+	sockets    []syscall.EpollEvent
+	poll       bool
+	event      Event
+	exited     bool
+	probe      bool
+	ready      bool
+	err        error
+	cleanupErr error
 }
 
 func (manager *manager) spawn(service *service, now time.Time) error {
@@ -604,13 +611,15 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	if app.Ready != "event" {
 		cmd.Stdout = os.Stderr
 	}
-	if err := cmd.Start(); err != nil {
+	job, err := manager.owner.Start(cmd)
+	if err != nil {
 		reader.Close()
 		writer.Close()
 		return err
 	}
 	writer.Close()
-	child := &process{cmd: cmd, service: service, config: app, active: make(map[string]time.Time), started: now}
+	cmd = job.cmd
+	child := &process{cmd: cmd, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
 	if app.Ready == "started" {
 		child.ready = true
 		child.idleSince = now
@@ -642,7 +651,8 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 		manager.messages <- message{process: child, err: err}
 	}()
 	go func() {
-		err := cmd.Wait()
+		err := manager.owner.Wait(job)
+		cleanupErr := job.Close()
 		// A descendant must not keep a dead worker's stdout pipe open forever.
 		select {
 		case <-scanned:
@@ -651,7 +661,7 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 			<-scanned
 		}
 		reader.Close()
-		manager.messages <- message{process: child, exited: true, err: err}
+		manager.messages <- message{process: child, exited: true, err: err, cleanupErr: cleanupErr}
 	}()
 	return nil
 }
@@ -689,6 +699,8 @@ type service struct {
 }
 
 type manager struct {
+	owner        *processOwner
+	cgroup       string
 	services     map[string]*service
 	workers      map[*process]struct{}
 	messages     chan message
@@ -705,12 +717,18 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	owner, err := newProcessOwner(initial.Cgroup, logger)
+	if err != nil {
+		return err
+	}
+	defer owner.Close()
 	poller, err := NewPoller()
 	if err != nil {
 		return fmt.Errorf("create listener poller: %w", err)
 	}
 	defer poller.Close()
 	manager := &manager{
+		owner: owner, cgroup: initial.Cgroup,
 		services: make(map[string]*service), workers: make(map[*process]struct{}),
 		messages: make(chan message, 256), log: logger, done: make(chan struct{}),
 		poller: poller, listeners: make(map[int32]*service),
@@ -737,10 +755,11 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	var result error
 	var pending *Snapshot
 	var retryConfig time.Time
-	var lastReap time.Time
 	for {
-		if manager.fatal != nil && !stopping {
+		if manager.fatal != nil && result == nil {
 			result = manager.fatal
+		}
+		if manager.fatal != nil && !stopping {
 			stopping = true
 			cancelWatch()
 			manager.shutdown()
@@ -776,10 +795,6 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 		case msg := <-manager.messages:
 			manager.handle(msg, time.Now())
 		case now := <-ticker.C:
-			if runtime.GOOS == "linux" && os.Getpid() == 1 && now.Sub(lastReap) >= time.Second {
-				manager.reapOrphans()
-				lastReap = now
-			}
 			if pending != nil && !stopping && !now.Before(retryConfig) {
 				if manager.apply(*pending) == nil {
 					pending = nil
@@ -791,45 +806,10 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	}
 }
 
-// PID 1 adopts orphaned grandchildren. Reap only zombies that are not managed
-// workers, so this never races exec.Cmd.Wait or waits for a running process.
-func (manager *manager) reapOrphans() {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		manager.log.Error("cannot inspect adopted processes", "error", err)
-		return
-	}
-	managed := make(map[int]bool)
-	for child := range manager.workers {
-		managed[child.cmd.Process.Pid] = true
-	}
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || managed[pid] {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
-		if err != nil {
-			continue // The process can exit between enumeration and inspection.
-		}
-		end := strings.LastIndex(string(data), ") ")
-		if end < 0 {
-			continue
-		}
-		fields := strings.Fields(string(data[end+2:]))
-		if len(fields) < 2 || fields[0] != "Z" || fields[1] != "1" {
-			continue
-		}
-		process, err := os.FindProcess(pid)
-		if err == nil {
-			if _, err := process.Wait(); err != nil {
-				manager.log.Warn("cannot reap adopted process", "pid", pid, "error", err)
-			}
-		}
-	}
-}
-
 func (manager *manager) apply(snapshot Snapshot) error {
+	if snapshot.Cgroup != manager.cgroup {
+		return fmt.Errorf("changing cgroup requires restarting ooth")
+	}
 	opened := make(map[string]*serviceListener)
 	committed := false
 	defer func() {
@@ -986,6 +966,9 @@ func (manager *manager) handle(msg message, now time.Time) {
 	}
 	service := child.service
 	if msg.exited {
+		if msg.cleanupErr != nil {
+			manager.fatal = fmt.Errorf("clean up worker %d descendants: %w", child.cmd.Process.Pid, msg.cleanupErr)
+		}
 		delete(manager.workers, child)
 		delete(service.workers, child)
 		manager.log.Info("worker exited", "app", service.name, "pid", child.cmd.Process.Pid, "error", msg.err)
@@ -1069,7 +1052,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			if !child.killed && now.Sub(child.stopping) >= app.StopTimeout {
 				child.killed = true
 				manager.log.Warn("worker exceeded graceful timeout", "pid", child.cmd.Process.Pid)
-				if err := child.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				if err := child.job.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					manager.log.Error("worker kill failed", "error", err)
 				}
 			}

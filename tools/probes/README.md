@@ -11,6 +11,12 @@ CGO_ENABLED=1 ./build/linux-amd64/go/bin/go test -race -timeout 60s .
 
 The first probe creates a real PID namespace with ooth as PID 1, starts a process that creates an orphan, checks that no zombie remains and stops ooth with SIGTERM. It cleans up the namespace on failure.
 
+Descendant ownership tests are part of the root Go suite. On Linux, set `OOTH_CGROUP_ROOT` to a delegated cgroup v2 and run the tests from that delegation; root is not required. `TestProcessJobOwnsOrphans` checks that a grandchild remains in its kernel group after its parent and optionally its root exit immediately, and that cleanup removes the surviving process and reaps zombies. `TestSupervisorCrashCleansDescendants` checks cleanup before restart. Without a writable cgroup the full ownership tests skip (an explicitly requested but unavailable test delegation fails); `TestCgroupUnavailableWarnsAndRuns` verifies the documented warning and direct-child fallback.
+
+For the separate migration-permission case, `OOTH_TEST_UNDELEGATED_GROUP` points at a cgroup whose directory and control files are writable to the test user, but whose common ancestor with the caller's cgroup does not permit migration. Run only `TestCgroupPlacementFallback` from outside that delegation. It verifies that failed atomic placement can fall back to a fresh command and emit the warning; Go commands cannot be started a second time after a failed Start.
+
+Windows ownership tests also check rejected breakaway, invalid creation-time Job assignment without running child code, and kernel cleanup when the Job-owning process exits without calling Close. Job utilities remain in application platform files; only creation-time assignment needs the new stdlib spawn field.
+
 Windows, from PowerShell (the GUI probe uses the installed .NET Framework C# compiler):
 
 ```powershell

@@ -20,10 +20,25 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Delegate a cgroup for Linux integration tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          group=/sys/fs/cgroup/ooth-ci
+          sudo mkdir "$group"
+          sudo chown "$(id -u):$(id -g)" "$group" "$group/cgroup.procs" "$group/cgroup.threads" "$group/cgroup.subtree_control"
+          echo "OOTH_CGROUP_ROOT=$group" >> "$GITHUB_ENV"
       - shell: bash
         run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo sh -c 'echo "$1" > "$2/cgroup.procs"' _ "$$" "$OOTH_CGROUP_ROOT"
+          fi
           export OOTH_TEST_PYTHON="$(python -c 'import sys; print(sys.executable)')"
           bash ./build.sh
+      - name: Remove the Linux test cgroup
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: sudo rmdir /sys/fs/cgroup/ooth-ci
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ runner.os }}
