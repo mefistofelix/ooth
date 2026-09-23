@@ -175,9 +175,6 @@ func Load(path string) (Snapshot, error) {
 			}
 			if app.Ready == "" {
 				app.Ready = "started"
-				if app.Listen.Network != "" {
-					app.Ready = "event"
-				}
 			}
 			if err := app.validate(); err != nil {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
@@ -574,6 +571,7 @@ type process struct {
 	job       *processJob
 	service   *service
 	ready     bool
+	telemetry bool
 	active    map[string]time.Time
 	started   time.Time
 	idleSince time.Time
@@ -592,6 +590,7 @@ type message struct {
 	event      Event
 	exited     bool
 	probe      bool
+	handshake  bool
 	ready      bool
 	err        error
 	cleanupErr error
@@ -630,9 +629,6 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 		return err
 	}
 	cmd.Stdout = writer
-	if app.Ready != "event" {
-		cmd.Stdout = os.Stderr
-	}
 	job, err := manager.owner.Start(cmd)
 	if err != nil {
 		reader.Close()
@@ -654,10 +650,17 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	scanned := make(chan struct{})
 	go func() {
 		defer close(scanned)
-		if app.Ready != "event" {
+		buffered := bufio.NewReaderSize(reader, 4096)
+		first, readErr := buffered.ReadSlice('\n')
+		event, parseErr := ParseEvent(string(first))
+		protocol := readErr == nil && parseErr == nil && event.Type == "ready"
+		manager.messages <- message{process: child, handshake: true, ready: protocol}
+		if !protocol {
+			os.Stderr.Write(first)
+			io.Copy(os.Stderr, buffered)
 			return
 		}
-		scanner := bufio.NewScanner(reader)
+		scanner := bufio.NewScanner(buffered)
 		scanner.Buffer(make([]byte, 4096), 4096)
 		for scanner.Scan() {
 			event, err := ParseEvent(scanner.Text())
@@ -1009,6 +1012,20 @@ func (manager *manager) handle(msg message, now time.Time) {
 		}
 		return
 	}
+	if msg.handshake {
+		child.telemetry = msg.ready
+		if msg.ready {
+			if child.config.Ready == "event" {
+				child.ready = true
+			}
+			child.idleSince = now
+		} else if child.config.Ready == "event" {
+			child.failed = true
+			manager.stop(child, now, "missing ready handshake")
+		}
+		manager.log.Info("worker stdout detected", "pid", child.cmd.Process.Pid, "telemetry", child.telemetry)
+		return
+	}
 	if msg.err != nil {
 		if child.stopping.IsZero() {
 			child.failed = true
@@ -1020,15 +1037,10 @@ func (manager *manager) handle(msg message, now time.Time) {
 	event := msg.event
 	switch event.Type {
 	case "ready":
-		if child.ready {
-			child.failed = true
-			manager.stop(child, now, "duplicate ready event")
-			return
-		}
-		child.ready = true
-		child.idleSince = now
+		child.failed = true
+		manager.stop(child, now, "duplicate ready event")
 	case "start":
-		if !child.ready || event.ID == "" || !child.active[event.ID].IsZero() {
+		if !child.telemetry || event.ID == "" || !child.active[event.ID].IsZero() {
 			child.failed = true
 			manager.stop(child, now, "invalid request start")
 			return
@@ -1183,7 +1195,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			available++
 			if !child.ready {
 				starting++
-			} else if len(child.active) >= app.Concurrency {
+			} else if child.telemetry && len(child.active) >= app.Concurrency {
 				busy++
 			}
 		}
@@ -1221,7 +1233,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			if available <= minimum {
 				break
 			}
-			idle := child.config.Ready == "event" && len(child.active) == 0 && now.Sub(child.idleSince) >= app.IdleTimeout
+			idle := child.telemetry && len(child.active) == 0 && now.Sub(child.idleSince) >= app.IdleTimeout
 			if service.listener == nil {
 				idle = !wanted[service.name] && now.Sub(service.unneededSince) >= app.IdleTimeout
 			}

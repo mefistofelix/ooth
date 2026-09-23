@@ -96,8 +96,8 @@ ready: tcp://127.0.0.1:5432
 
 The first demand for `web` activates `database` and `cache` together. `web` starts after both are ready. Shared prerequisites start once. This is an internal dependency graph, not an additional control socket.
 
-- `ready: started`: ready as soon as process creation succeeds; default for virtual services. This orders process creation, not application initialization.
-- `ready: event`: wait for the stdout `ready` event; default for socket workers.
+- `ready: started`: ready as soon as process creation succeeds; default for all services. This orders process creation, not application initialization, and works even with silent stdout.
+- `ready: event`: explicitly require the first stdout line to be the `ready` handshake before releasing dependent services. A different first line fails this readiness requirement; silence reaches `start_timeout`.
 - `ready: tcp://host:port` or `unix://path`: connect to the endpoint until it responds. Probes establish and close a real connection, so use an endpoint that tolerates that.
 - `startup: true`: activate at supervisor startup and keep at least one worker.
 
@@ -106,8 +106,8 @@ Virtual services have `max_workers: 1`. They remain running while needed, then s
 ## Worker convention
 
 1. Convert inherited stdin into a listening socket: fd 0 on Unix, `STD_INPUT_HANDLE` on Windows. Do not read request bytes from stdin as a stream.
-2. Use stdout exclusively for events when `ready: event`; send logs to stderr.
-3. Emit `ready`, then `start` and `end` for every request. Flush each complete line. Concurrent workers must serialize writes to their own event stream.
+2. To opt into request telemetry, make the first stdout line the `ready` handshake below. This detection is independent of the configured readiness gate. Send logs to stderr after opting in.
+3. Emit `start` and `end` for every request. Flush each complete line. Concurrent workers must serialize writes to their own event stream.
 4. On the graceful signal, stop accepting new requests, finish active requests, then exit.
 
 ```text
@@ -116,9 +116,11 @@ v=1 event=start ts=1790193600001000000 id=42
 v=1 event=end ts=1790193600002000000 id=42 duration_ns=1000000
 ```
 
-No JSON, escaping, or control channel. Fields are space-separated `key=value` pairs; values are printable ASCII without spaces or `=`. Request IDs are unique among active requests within one worker. `ts` is Unix time in nanoseconds; `duration_ns` is elapsed request time in nanoseconds, preferably measured with a monotonic clock. Supervisor deadlines use its own monotonic clock, so worker clock changes cannot extend them. Unknown/duplicate fields, oversized lines (4096-byte limit), invalid event order, and a broken event stream stop that worker and enter the restart policy.
+The first complete stdout line must be a valid version-1 `ready` event to enable telemetry. Otherwise stdout is forwarded to ooth's stderr as ordinary output for that worker's lifetime, including any later protocol-looking lines. A silent worker remains supervised without telemetry. Without the handshake there is no request-based growth, idle shrinking or request watchdog; configured minimum workers, cold activation, crash restart and shutdown still work. Virtual dependencies can still stop when no longer required. This default needs no worker changes; `ready: event` opts into the stricter readiness requirement described above.
 
-The environment contains `OOTH_WORKER=1` and `OOTH_CONCURRENCY`. Configuration cannot override `OOTH_*`. No ooth library is needed in the worker. See [examples/worker.py](examples/worker.py). Existing FastCGI programs may inherit stdin in a compatible way but need telemetry integration to support request-based scaling and idle detection. With `ready: started`, ooth cannot infer their active requests or perform telemetry-based scaling/shrinking.
+No JSON, escaping, or control channel. Fields are space-separated `key=value` pairs; values are printable ASCII without spaces or `=`. Request IDs are unique among active requests within one worker. `ts` is Unix time in nanoseconds; `duration_ns` is elapsed request time in nanoseconds, preferably measured with a monotonic clock. Supervisor deadlines use its own monotonic clock, so worker clock changes cannot extend them. After an accepted handshake, unknown/duplicate fields, oversized lines (4096-byte limit), invalid event order, and a broken event stream stop that worker and enter the restart policy. Ordinary output has no protocol line-length limit.
+
+The environment contains `OOTH_WORKER=1` and `OOTH_CONCURRENCY`. Configuration cannot override `OOTH_*`. No ooth library is needed in the worker. See [examples/worker.py](examples/worker.py). Existing FastCGI programs may inherit stdin in a compatible way but need the handshake and request events to support request-based scaling and idle detection, regardless of `ready` configuration.
 
 ## Platform details
 

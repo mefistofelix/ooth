@@ -50,7 +50,7 @@ func TestConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Apps["web"].Ready != "event" || config.Apps["db"].Ready != "started" {
+	if config.Apps["web"].Ready != "started" || config.Apps["db"].Ready != "started" {
 		t.Fatal("readiness defaults")
 	}
 	if !filepath.IsAbs(config.Apps["web"].Command[0]) {
@@ -82,6 +82,9 @@ func TestWorkerHelper(t *testing.T) {
 		ctx = context.Background()
 	}
 	emit := func(event Event) {
+		if os.Getenv("TEST_OOTH_STDOUT") == "silent" {
+			return
+		}
 		event.Time = time.Now().UnixNano()
 		if err := WriteEvent(os.Stdout, event); err != nil {
 			os.Exit(2)
@@ -102,6 +105,16 @@ func TestWorkerHelper(t *testing.T) {
 	}
 	os.Stdin.Close()
 	go func() { <-ctx.Done(); listener.Close() }()
+	switch os.Getenv("TEST_OOTH_STDOUT") {
+	case "plain":
+		fmt.Fprintln(os.Stdout, "ordinary startup log")
+	case "long":
+		fmt.Fprintln(os.Stdout, strings.Repeat("x", 9000))
+	case "partial":
+		fmt.Fprint(os.Stdout, "v=1 event=ready ts=1")
+		os.Stdout.Close()
+		emit = func(Event) {}
+	}
 	emit(Event{Type: "ready"})
 	for {
 		connection, err := listener.Accept()
