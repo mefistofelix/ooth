@@ -8,6 +8,8 @@ This is an experimental nucleus, not a replacement for all of systemd. It superv
 
 ## Build and run
 
+The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. Its integration with an inherited activation listener is still blocked by a missing public native-server adoption API and a Windows stdin initialization issue; those control tests are not a working ooth HTTP worker adapter.
+
 ```sh
 bash ./build.sh
 ./bin/ooth-linux-amd64 -check -config examples/ooth.yaml
