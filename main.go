@@ -73,7 +73,14 @@ type Socket struct {
 	Address string `yaml:"address"`
 }
 
+type Identity struct {
+	User     string  `yaml:"user"`
+	Group    string  `yaml:"group"`
+	Password *string `yaml:"password"`
+}
+
 type App struct {
+	Identity       Identity          `yaml:",inline"`
 	Name           string            `yaml:"name"`
 	Requires       []string          `yaml:"requires"`
 	Startup        bool              `yaml:"startup"`
@@ -243,6 +250,15 @@ func validateDependencies(apps map[string]App) error {
 }
 
 func (app App) validate() error {
+	if app.Identity.Password != nil && app.Identity.User == "" {
+		return fmt.Errorf("password requires user")
+	}
+	if runtime.GOOS == "linux" && app.Identity.Password != nil {
+		return fmt.Errorf("password is only supported on Windows")
+	}
+	if runtime.GOOS == "windows" && app.Identity.Group != "" {
+		return fmt.Errorf("group is only supported on Linux")
+	}
 	if len(app.Command) == 0 || app.Command[0] == "" {
 		return fmt.Errorf("command must be a non-empty argument list")
 	}
@@ -283,7 +299,8 @@ func read(path string, target any) error {
 	defer file.Close()
 	decoder := yaml.NewDecoder(file, yaml.Strict())
 	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		// Configuration can contain passwords; do not include YAML source excerpts.
+		return fmt.Errorf("%s: %s", path, yaml.FormatError(err, false, false))
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
@@ -593,6 +610,11 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	app := service.config
 	cmd := exec.Command(app.Command[0], app.Command[1:]...)
 	cmd.Dir = app.Directory
+	releaseIdentity, err := app.Identity.apply(cmd)
+	if err != nil {
+		return fmt.Errorf("worker identity: %w", err)
+	}
+	defer releaseIdentity()
 	cmd.Env = os.Environ()
 	for key, value := range app.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)

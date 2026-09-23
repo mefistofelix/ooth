@@ -62,6 +62,28 @@ Defaults are shown above except `max_workers`, which defaults to 1. `concurrency
 
 Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers count against `max_workers`, so an update can queue requests while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
 
+## Process identity
+
+Application YAML may select an account for both socket workers and ordinary services. Omit these fields to inherit ooth's identity:
+
+```yaml
+# Linux: names or numeric IDs of existing accounts/groups.
+user: www-data
+group: www-data
+```
+
+```yaml
+# Windows: local name, DOMAIN\user, or user@domain.
+user: 'MACHINE\worker'
+password: 'account-password'
+```
+
+Linux sets the UID, primary GID and account's supplementary groups in the child. The primary group defaults to the account's group. An unprivileged caller retaining its own UID keeps its existing supplementary groups. Changing identity requires the corresponding OS permissions. With CGO disabled, account lookup uses `/etc/passwd` and `/etc/group`, not NSS plugins.
+
+Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and stdin inheritance. A different account requires `password`; an explicit empty string is passed as an empty password. The current account can be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
+
+The password is read directly from YAML as requested; restrict that file's permissions. It is not placed in the worker's arguments or environment, and YAML diagnostics omit source excerpts. This switches process credentials, without loading a Windows profile or constructing a login environment; use `env` and `directory` for application settings. Linux rejects `password`; Windows rejects `group`. Linux different-user listener inheritance was tested locally; Windows current-user inheritance and authentication failures passed, while a successful different-account Windows spawn still needs validation with a suitable account. `OOTH_TEST_WINDOWS_USER` and `OOTH_TEST_WINDOWS_PASSWORD` enable that optional test only.
+
 ## Virtual activation and dependencies
 
 An app without `listen` is a virtual activation target. It needs no inherited socket or ooth protocol:

@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -142,4 +145,75 @@ func TestSubreaperWithoutCgroup(t *testing.T) {
 	// Do not Wait here: SIGCHLD handling in the owner must reap the orphan.
 	assertProcessGone(t, leaf)
 	assertProcessGone(t, treePID(t, filepath.Join(directory, "middle")))
+}
+
+func TestIdentityDifferentLinuxUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("run as root to verify dropping to another UID/GID")
+	}
+	account, err := user.Lookup("nobody")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := user.LookupGroupId("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The normal Go test build directory is private to its owner. Copy only
+	// this fixture into an accessible temporary directory for the other user.
+	directory := t.TempDir()
+	for _, path := range []string{filepath.Dir(directory), directory} {
+		if err := os.Chmod(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := os.Open(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	path := filepath.Join(directory, "worker")
+	target, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(target, source)
+	target.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, identity := range []Identity{{User: account.Username, Group: group.Name}, {User: account.Uid, Group: group.Gid}} {
+		reply := runIdentityWorker(t, path, identity)
+		if reply["uid"] != account.Uid || reply["gid"] != group.Gid {
+			t.Fatalf("worker identity: %v", reply)
+		}
+		for _, group := range strings.Split(reply["groups"], ",") {
+			if group == "0" {
+				t.Fatal("worker retained the supervisor's root group")
+			}
+		}
+	}
+}
+
+func TestIdentityChangeDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires an unprivileged caller")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	release, err := (Identity{User: "root"}).apply(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	owner, err := newProcessOwner(filepath.Join(t.TempDir(), "missing"), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if job, err := owner.Start(cmd); err == nil {
+		job.Kill()
+		owner.Wait(job)
+		job.Close()
+		t.Fatal("silently started despite denied identity change")
+	}
 }

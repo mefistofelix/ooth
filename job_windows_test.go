@@ -3,7 +3,9 @@ package main
 import (
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -85,5 +87,37 @@ func TestJobOwnerExitKillsFamily(t *testing.T) {
 	}
 	for _, stage := range []string{"root", "middle", "leaf"} {
 		assertProcessGone(t, treePID(t, filepath.Join(directory, stage)))
+	}
+}
+
+func TestIdentityWindowsLogonFailure(t *testing.T) {
+	password := "ooth-example-password-for-error-test"
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	release, err := (Identity{User: "ooth-missing-account-" + t.Name(), Password: &password}).apply(cmd)
+	if release != nil {
+		release()
+	}
+	if err == nil || strings.Contains(err.Error(), password) || cmd.Process != nil {
+		t.Fatal("failed logon was not rejected safely")
+	}
+}
+
+func TestIdentityDifferentWindowsUser(t *testing.T) {
+	username := os.Getenv("OOTH_TEST_WINDOWS_USER")
+	password, supplied := os.LookupEnv("OOTH_TEST_WINDOWS_PASSWORD")
+	if username == "" || !supplied {
+		t.Skip("set OOTH_TEST_WINDOWS_USER and OOTH_TEST_WINDOWS_PASSWORD in a suitably privileged test session")
+	}
+	account, err := user.Lookup(username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := runIdentityWorker(t, executable, Identity{User: username, Password: &password})
+	if reply["uid"] != account.Uid {
+		t.Fatalf("worker SID %s, expected %s", reply["uid"], account.Uid)
 	}
 }

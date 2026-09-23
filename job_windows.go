@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"os/user"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -15,6 +17,67 @@ var setJobInformation = jobKernel.NewProc("SetInformationJobObject")
 var queryJobInformation = jobKernel.NewProc("QueryInformationJobObject")
 var terminateJobObject = jobKernel.NewProc("TerminateJobObject")
 var isProcessInJob = jobKernel.NewProc("IsProcessInJob")
+var logonUser = syscall.NewLazyDLL("advapi32.dll").NewProc("LogonUserW")
+
+func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
+	if identity.Group != "" {
+		return nil, fmt.Errorf("group is only supported on Linux")
+	}
+	if identity.User == "" {
+		if identity.Password != nil {
+			return nil, fmt.Errorf("password requires user")
+		}
+		return func() {}, nil
+	}
+	if identity.Password == nil {
+		account, err := user.Lookup(identity.User)
+		if err != nil {
+			return nil, err
+		}
+		current, err := user.Current()
+		if err != nil {
+			return nil, err
+		}
+		if account.Uid != current.Uid {
+			return nil, fmt.Errorf("password is required to obtain a token for Windows account %q", identity.User)
+		}
+		return func() {}, nil
+	}
+	username, domain := identity.User, "."
+	if prefix, suffix, ok := strings.Cut(username, `\`); ok {
+		domain, username = prefix, suffix
+	} else if strings.Contains(username, "@") {
+		domain = "" // UPN: LogonUser requires a null domain pointer.
+	}
+	name, err := syscall.UTF16PtrFromString(username)
+	if err != nil {
+		return nil, err
+	}
+	var domainName *uint16
+	if domain != "" {
+		domainName, err = syscall.UTF16PtrFromString(domain)
+		if err != nil {
+			return nil, err
+		}
+	}
+	password, err := syscall.UTF16FromString(*identity.Password)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(password)
+	var token syscall.Token
+	// LOGON32_LOGON_BATCH obtains a primary token for unattended workers.
+	if ok, _, err := logonUser.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(domainName)), uintptr(unsafe.Pointer(&password[0])), 4, 0, uintptr(unsafe.Pointer(&token))); ok == 0 {
+		return nil, fmt.Errorf("LogonUser for %q: %w", identity.User, err)
+	}
+	attr := syscall.SysProcAttr{}
+	if cmd.SysProcAttr != nil {
+		attr = *cmd.SysProcAttr
+	}
+	attr.Token = token
+	cmd.SysProcAttr = &attr
+	return func() { token.Close() }, nil
+}
 
 type processOwner struct{}
 

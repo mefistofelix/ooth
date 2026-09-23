@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,69 @@ import (
 	"syscall"
 	"unsafe"
 )
+
+func (identity Identity) apply(cmd *exec.Cmd) (func(), error) {
+	if identity.Password != nil {
+		return nil, fmt.Errorf("password is only supported on Windows")
+	}
+	if identity.User == "" && identity.Group == "" {
+		return func() {}, nil
+	}
+	var account *user.User
+	var err error
+	if identity.User == "" {
+		account, err = user.LookupId(strconv.Itoa(os.Geteuid()))
+	} else if _, numeric := strconv.ParseUint(identity.User, 10, 32); numeric == nil {
+		account, err = user.LookupId(identity.User)
+	} else {
+		account, err = user.Lookup(identity.User)
+	}
+	if err != nil {
+		return nil, err
+	}
+	groupID := account.Gid
+	if identity.Group != "" {
+		var group *user.Group
+		if _, numeric := strconv.ParseUint(identity.Group, 10, 32); numeric == nil {
+			group, err = user.LookupGroupId(identity.Group)
+		} else {
+			group, err = user.LookupGroup(identity.Group)
+		}
+		if err != nil {
+			return nil, err
+		}
+		groupID = group.Gid
+	}
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := strconv.ParseUint(groupID, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := account.GroupIds()
+	if err != nil {
+		return nil, err
+	}
+	credential := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+	for _, group := range groups {
+		value, err := strconv.ParseUint(group, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		credential.Groups = append(credential.Groups, uint32(value))
+	}
+	// An unprivileged caller cannot call setgroups even for its own identity.
+	credential.NoSetGroups = os.Geteuid() != 0 && credential.Uid == uint32(os.Geteuid())
+	attr := syscall.SysProcAttr{}
+	if cmd.SysProcAttr != nil {
+		attr = *cmd.SysProcAttr
+	}
+	attr.Credential = credential
+	cmd.SysProcAttr = &attr
+	return func() {}, nil
+}
 
 type processOwner struct {
 	mu               sync.Mutex
