@@ -6,6 +6,7 @@ require (
 	github.com/goccy/go-yaml v1.19.2
 	github.com/sgtdi/fswatcher v1.3.0
 	github.com/shirou/gopsutil/v4 v4.26.8
+	golang.org/x/sys v0.45.0
 )
 
 require (
@@ -16,5 +17,4 @@ require (
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 )

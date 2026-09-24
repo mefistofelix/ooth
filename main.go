@@ -42,6 +42,8 @@ func main() {
 	check := flag.Bool("check", false, "validate configuration and exit")
 	debug := flag.Bool("debug", false, "log request metrics")
 	showVersion := flag.Bool("version", false, "print build version")
+	serviceName := flag.String("service", "", "run as the named Windows SCM service")
+	logPath := flag.String("log-file", "", "append logs to a file instead of stderr")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -51,7 +53,17 @@ func main() {
 	if *debug {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logOutput := os.Stderr
+	if *logPath != "" {
+		var err error
+		logOutput, err = os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer logOutput.Close()
+	}
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 	if *check {
 		if _, err := Load(*path); err != nil {
@@ -59,6 +71,13 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("configuration valid")
+		return
+	}
+	if *serviceName != "" {
+		if err := runSCM(*serviceName, *path, logger); err != nil {
+			logger.Error("SCM service stopped", "error", err)
+			os.Exit(1)
+		}
 		return
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, StopSignal)
@@ -271,6 +290,7 @@ type App struct {
 	Env            map[string]string `yaml:"env"`
 	Vars           map[string]string `yaml:"vars,omitempty"`
 	RestartOn      []RestartRule     `yaml:"restart_on,omitempty"`
+	SCM            *SCMService       `yaml:"scm,omitempty"`
 	Listen         Socket            `yaml:"listen"`
 	SocketHandoff  string            `yaml:"socket_handoff,omitempty"`
 	SocketMode     *Permissions      `yaml:"socket_mode"`
@@ -285,6 +305,11 @@ type App struct {
 	ScaleWindow    time.Duration     `yaml:"scale_window,omitempty"`
 	ScaleDelay     time.Duration     `yaml:"scale_delay,omitempty"` // Legacy spelling of scale_window.
 	Source         string            `yaml:"-"`
+}
+
+type SCMService struct {
+	Name string   `yaml:"name"`
+	Args []string `yaml:"args,omitempty"`
 }
 
 type RestartRule struct {
@@ -348,6 +373,7 @@ func Load(path string) (Snapshot, error) {
 		result.Cgroup = resolve(filepath.Dir(path), main.Cgroup)
 	}
 	sockets := make(map[Socket]string)
+	scmServices := make(map[string]string)
 	for _, pattern := range main.Watch {
 		pattern = resolve(filepath.Dir(path), pattern)
 		root, err := watchRoot(pattern)
@@ -394,7 +420,7 @@ func Load(path string) (Snapshot, error) {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
 			}
 			app.Directory = resolve(filepath.Dir(file), app.Directory)
-			if !strings.Contains(app.Command[0], "{{") && strings.ContainsAny(app.Command[0], `/\`) {
+			if app.SCM == nil && !strings.Contains(app.Command[0], "{{") && strings.ContainsAny(app.Command[0], `/\`) {
 				app.Command[0] = resolve(app.Directory, app.Command[0])
 			}
 			if app.Listen.Network == "unix" {
@@ -402,6 +428,13 @@ func Load(path string) (Snapshot, error) {
 			}
 			if _, _, err := app.expandLaunch(app.Listen.Address); err != nil {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
+			}
+			if app.SCM != nil {
+				name := strings.ToLower(app.SCM.Name)
+				if previous, ok := scmServices[name]; ok {
+					return Snapshot{}, fmt.Errorf("%s and %s control the same SCM service", previous, file)
+				}
+				scmServices[name] = file
 			}
 			for index := range app.RestartOn {
 				rule := &app.RestartOn[index]
@@ -496,7 +529,17 @@ func (app App) validate() error {
 	if runtime.GOOS == "windows" && app.Identity.Group != "" {
 		return fmt.Errorf("group is only supported on Linux")
 	}
-	if len(app.Command) == 0 || app.Command[0] == "" {
+	if app.SCM != nil {
+		if runtime.GOOS != "windows" || app.SCM.Name == "" || strings.ContainsRune(app.SCM.Name, 0) {
+			return fmt.Errorf("scm requires Windows and a non-empty service name")
+		}
+		if len(app.Command) != 0 || len(app.Env) != 0 || app.Directory != "" || app.Identity.User != "" || app.Listen != (Socket{}) || app.SocketHandoff != "" {
+			return fmt.Errorf("scm uses the registered service command, environment and identity; command, env, directory and socket handoff are unavailable")
+		}
+		if app.MaxWorkers != 1 || app.Ready != "started" {
+			return fmt.Errorf("scm requires max_workers: 1 and uses SCM running status for readiness")
+		}
+	} else if len(app.Command) == 0 || app.Command[0] == "" {
 		return fmt.Errorf("command must be a non-empty argument list")
 	}
 	if app.Listen.Network != "" && app.Listen.Network != "tcp" && app.Listen.Network != "tcp4" && app.Listen.Network != "tcp6" && app.Listen.Network != "unix" {
@@ -683,18 +726,22 @@ func (app App) expandLaunch(address string) ([]string, map[string]string, error)
 		}
 		return result.String(), nil
 	}
-	command := make([]string, len(app.Command))
-	for index, argument := range app.Command {
-		value, err := expand(fmt.Sprintf("command[%d]", index), argument)
+	arguments, field := app.Command, "command"
+	if app.SCM != nil {
+		arguments, field = app.SCM.Args, "scm.args"
+	}
+	command := make([]string, len(arguments))
+	for index, argument := range arguments {
+		value, err := expand(fmt.Sprintf("%s[%d]", field, index), argument)
 		if err != nil {
 			return nil, nil, err
 		}
 		command[index] = value
 	}
-	if len(command) == 0 || command[0] == "" {
+	if app.SCM == nil && (len(command) == 0 || command[0] == "") {
 		return nil, nil, fmt.Errorf("expanded command must name an executable")
 	}
-	if strings.ContainsAny(command[0], `/\`) {
+	if app.SCM == nil && strings.ContainsAny(command[0], `/\`) {
 		command[0] = resolve(app.Directory, command[0])
 	}
 	childEnv := make(map[string]string, len(app.Env))
@@ -997,6 +1044,8 @@ func (poller *Poller) Close() error {
 }
 
 type process struct {
+	pid       int
+	scm       serviceControl
 	cmd       *exec.Cmd
 	control   *os.File
 	job       *processJob
@@ -1014,7 +1063,14 @@ type process struct {
 	config    App
 }
 
+type serviceControl interface {
+	Stop()
+	Kill() error
+}
+
 type message struct {
+	scm        bool
+	pid        int
 	process    *process
 	sockets    []syscall.EpollEvent
 	poll       bool
@@ -1029,6 +1085,9 @@ type message struct {
 }
 
 func (manager *manager) spawn(service *service, now time.Time) error {
+	if service.config.SCM != nil {
+		return manager.spawnSCM(service, now)
+	}
 	var childFile *os.File
 	if service.listener != nil {
 		var err error
@@ -1106,7 +1165,7 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	}
 	writer.Close()
 	cmd = job.cmd
-	child := &process{cmd: cmd, control: control, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
+	child := &process{pid: cmd.Process.Pid, cmd: cmd, control: control, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
 	control = nil
 	if app.Ready == "started" {
 		child.ready = true
@@ -1255,6 +1314,10 @@ type manager struct {
 }
 
 func Run(ctx context.Context, path string, logger *slog.Logger) error {
+	return run(ctx, path, logger, nil)
+}
+
+func run(ctx context.Context, path string, logger *slog.Logger, ready func()) error {
 	initial, err := Load(path)
 	if err != nil {
 		return err
@@ -1302,6 +1365,9 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	var result error
 	var pending *Snapshot
 	var retryConfig time.Time
+	if ready != nil {
+		ready()
+	}
 	for {
 		if manager.fatal != nil && result == nil {
 			result = manager.fatal
@@ -1543,18 +1609,22 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 		child.service.demand = true
 		child.service.backoff(now)
 	}
-	manager.log.Info("worker stopping", "app", child.service.name, "pid", child.cmd.Process.Pid, "reason", reason)
+	manager.log.Info("worker stopping", "app", child.service.name, "pid", child.pid, "reason", reason)
+	if child.scm != nil {
+		child.scm.Stop()
+		return
+	}
 	if child.telemetry && child.control != nil {
 		// One short write per process fits in the empty stdin pipe; no reader
 		// cooperation is needed to return. The existing deadline bounds draining.
 		if _, err := fmt.Fprintf(child.control, "v=1 event=stop ts=%d\n", now.UnixNano()); err == nil {
 			return
 		} else {
-			manager.log.Warn("stdin stop failed; sending signal", "pid", child.cmd.Process.Pid, "error", err)
+			manager.log.Warn("stdin stop failed; sending signal", "pid", child.pid, "error", err)
 		}
 	}
 	if err := child.cmd.Process.Signal(StopSignal); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		manager.log.Error("graceful signal failed", "pid", child.cmd.Process.Pid, "error", err)
+		manager.log.Error("graceful signal failed", "pid", child.pid, "error", err)
 	}
 }
 
@@ -1585,13 +1655,20 @@ func (manager *manager) handle(msg message, now time.Time) {
 	}
 	service := child.service
 	defer service.observePressure(now)
+	if msg.scm {
+		child.pid = msg.pid
+		child.ready = msg.ready
+		child.idleSince = now
+		manager.log.Info("SCM service status", "app", service.name, "pid", msg.pid, "ready", msg.ready)
+		return
+	}
 	if msg.exited {
 		if msg.cleanupErr != nil {
-			manager.fatal = fmt.Errorf("clean up worker %d descendants: %w", child.cmd.Process.Pid, msg.cleanupErr)
+			manager.fatal = fmt.Errorf("clean up worker %d: %w", child.pid, msg.cleanupErr)
 		}
 		delete(manager.workers, child)
 		delete(service.workers, child)
-		manager.log.Info("worker exited", "app", service.name, "pid", child.cmd.Process.Pid, "error", msg.err)
+		manager.log.Info("worker exited", "app", service.name, "pid", child.pid, "error", msg.err)
 		if child.stopping.IsZero() {
 			service.demand = true
 			service.backoff(now)
@@ -1618,13 +1695,13 @@ func (manager *manager) handle(msg message, now time.Time) {
 			child.failed = true
 			manager.stop(child, now, "missing ready handshake")
 		}
-		manager.log.Info("worker stdout detected", "app", service.name, "pid", child.cmd.Process.Pid, "telemetry", child.telemetry)
+		manager.log.Info("worker stdout detected", "app", service.name, "pid", child.pid, "telemetry", child.telemetry)
 		return
 	}
 	if msg.err != nil {
 		if child.stopping.IsZero() {
 			child.failed = true
-			manager.log.Warn("worker event stream failed", "pid", child.cmd.Process.Pid, "error", msg.err)
+			manager.log.Warn("worker event stream failed", "pid", child.pid, "error", msg.err)
 			manager.stop(child, now, msg.err.Error())
 		}
 		return
@@ -1642,7 +1719,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		}
 		child.active[event.ID] = now
 		child.idleSince = time.Time{}
-		manager.log.Debug("request started", "app", service.name, "pid", child.cmd.Process.Pid, "id", event.ID, "ts", event.Time)
+		manager.log.Debug("request started", "app", service.name, "pid", child.pid, "id", event.ID, "ts", event.Time)
 	case "end":
 		if child.active[event.ID].IsZero() {
 			child.failed = true
@@ -1653,7 +1730,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		if len(child.active) == 0 {
 			child.idleSince = now
 		}
-		manager.log.Debug("request finished", "app", service.name, "pid", child.cmd.Process.Pid,
+		manager.log.Debug("request finished", "app", service.name, "pid", child.pid,
 			"id", event.ID, "ts", event.Time, "duration_ns", event.DurationNS)
 	}
 }
@@ -1681,8 +1758,14 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		if !child.stopping.IsZero() {
 			if !child.killed && now.Sub(child.stopping) >= app.StopTimeout {
 				child.killed = true
-				manager.log.Warn("worker exceeded graceful timeout", "pid", child.cmd.Process.Pid)
-				if err := child.job.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				manager.log.Warn("worker exceeded graceful timeout", "pid", child.pid)
+				var err error
+				if child.scm != nil {
+					err = child.scm.Kill()
+				} else {
+					err = child.job.Kill()
+				}
+				if err != nil && !errors.Is(err, os.ErrProcessDone) {
 					manager.log.Error("worker kill failed", "error", err)
 				}
 			}
@@ -1692,7 +1775,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			child.failed = true
 			manager.stop(child, now, "startup timeout")
 		}
-		if !child.ready && app.Ready != "event" && !child.probing && !now.Before(child.nextProbe) && child.stopping.IsZero() {
+		if child.scm == nil && !child.ready && app.Ready != "event" && !child.probing && !now.Before(child.nextProbe) && child.stopping.IsZero() {
 			child.probing = true
 			go func() {
 				network, address, _ := strings.Cut(app.Ready, "://")
@@ -1807,6 +1890,9 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			grow = true
 		}
 		grow = grow || (blocked == "" && pressureGrowth)
+		if app.SCM != nil && len(service.workers) != 0 {
+			grow = false // One SCM name is one instance, including while stopping.
+		}
 		if grow && starting == 0 && available < app.MaxWorkers && !now.Before(service.retryAt) {
 			if err := manager.spawn(service, now); err != nil {
 				service.backoff(now)

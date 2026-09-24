@@ -1,12 +1,12 @@
 # ooth
 
-Minimal process supervisor with lazy socket activation, written in Go. The supervisor lives in **`main.go`**, with process ownership utilities in `job_linux.go` and `job_windows.go`, selected by Go at compilation. Linux and Windows builds use `CGO_ENABLED=0`; the executable does not need Go, a shell, or external management commands at runtime. Windows still uses the operating system's DLLs.
+Minimal process supervisor with lazy socket activation, written in Go. The supervisor lives in **`main.go`**, with process ownership utilities in `job_linux.go` and `job_windows.go` and optional Windows service integration in `scm_windows.go`, selected by Go at compilation. Linux and Windows builds use `CGO_ENABLED=0`; the executable does not need Go, a shell, or external management commands at runtime. Windows still uses the operating system's DLLs.
 
 ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool; each worker inherits an additional listener handle, reads its number from `OOTH_LISTEN_HANDLE`, and accepts connections itself. Legacy stdin handoff is configurable. **ooth never accepts, reads, copies, or proxies application traffic.** “Copyless” here means no forwarding through the supervisor, not that the operating system or application performs no copies.
 
 An app without `listen` runs as an ordinary process pool. The same minimum, maximum, telemetry, scaling and shutdown rules apply; the program can open its own listener. There is no special reuseport mode in ooth.
 
-This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. It does not mount filesystems, configure the machine, or implement a service manager for Windows SCM.
+This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. Optional Windows SCM integration lets ooth run as a service and control registered services. It does not mount filesystems or configure the machine.
 
 ## Build and run
 
@@ -173,7 +173,8 @@ An app with minimum zero and no fresh demand stays at zero after draining;
 editing a file never wakes an already dormant app. The previous autoscaled
 worker count is not restored automatically. Init services kept alive by
 `min_workers`, `startup` or a dependency start replacements during retirement too.
-Programs owning exclusive resources must release them as part of graceful stop;
+An SCM service has one registered instance and waits for its previous instance
+to stop before restarting. Programs owning exclusive resources must release them as part of graceful stop;
 otherwise their replacement may need the normal startup retry/backoff.
 
 For example, with `min_workers: 0` and `max_workers: 1`, worker A is answering
@@ -402,11 +403,96 @@ The Windows toolchain patch:
 - Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. Visible GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
 - Adds `syscall.SysProcAttr.JobObjects` and passes those handles through `PROC_THREAD_ATTRIBUTE_JOB_LIST` during process creation, before child code can run. Requires Windows 10 / Server 2016 or newer. Job creation, queries and termination live in `job_windows.go`, outside the toolchain patch. No `taskkill`, PowerShell, or shell command is launched by ooth.
 
-Workers without stdin protocol support must handle the OS graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Windows SCM service control is not implemented. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
+Workers without stdin protocol support must handle the OS graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Explicit SCM services use the separate control path below. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
+
+### Optional Windows SCM support
+
+To run ooth as an already registered **own-process** Windows service, configure
+its service command line with absolute paths, for example:
+
+```text
+C:\ooth\ooth.exe -service Ooth -config C:\ooth\ooth.yaml -log-file C:\ooth\ooth.log
+```
+
+`-service` enters the native SCM dispatcher. It reports start-pending until
+ooth has loaded its configuration and bound listeners, then running. SCM stop
+and shutdown requests cancel the supervisor and use its normal dependency-aware
+graceful shutdown and worker timeouts. While shutting down it reports stop-pending
+with progress checkpoints; it reports completion only after the supervisor exits.
+Startup/runtime failures produce a nonzero service exit code. `-log-file` appends
+logs because service processes generally have no useful stderr. Ordinary console
+execution remains the default. Linux rejects `-service`.
+
+An application can instead name another **already registered** Windows service:
+
+```yaml
+name: database
+scm:
+  name: ExampleDatabase
+  args: ['{{.vars.mode}}']
+vars:
+  mode: production
+min_workers: 1
+start_timeout: 30s
+stop_timeout: 15s
+restart_on:
+  - glob: database-config/**/*.yaml
+```
+
+ooth calls `StartService` and `ControlService(STOP)` directly, with no `sc.exe`,
+PowerShell or helper process. `scm.args` are arguments to the registered service's
+ServiceMain, expanded with the existing placeholders; they are not executable
+command-line arguments. Command, environment, working directory and identity
+come from the SCM registration, so ooth rejects their per-app overrides here.
+Socket inheritance and stdout telemetry are unavailable through SCM.
+
+SCM running status supplies readiness. The normal `startup`, `min_workers`,
+dependencies, crash backoff and `restart_on` rules apply, with `max_workers: 1`.
+There is no request-based scaling or activation by a parent socket. The same
+SCM name cannot appear in two app definitions. A service already active at the
+first start attempt is left alone and reported as an error; ooth does not take
+ownership of an instance someone else started. Configure SCM recovery separately
+so it does not compete with ooth's restart policy.
+
+State changes use native
+[service subscriptions](https://learn.microsoft.com/en-us/windows/win32/services/subscribeservicechangenotifications),
+not periodic enumeration. Stop timeout terminates the retained service process
+handle, protecting against PID reuse. Only own-process services are accepted:
+killing a shared service host would also kill unrelated services. A PID may not
+yet be valid during start-pending; a force request is retained and applied
+when a running/paused state provides a valid PID. Until then forced termination
+cannot be guaranteed: SCM does not guarantee a valid PID in pending states,
+as documented for [QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex).
+SCM services are created by Windows outside
+ooth's worker Job, so this path does not claim Job-based descendant ownership.
+
+The caller needs service query/start/stop rights and terminate access to the
+service process. ooth does not register services, change accounts or recovery
+settings, elevate privileges, or convert a console executable into an SCM service.
+Registration is an administrator/deployment step; the service executable must
+already implement the SCM protocol.
+
+`TestSCMHostGraceful`, `TestSCMHostStartupError`, `TestSCMRetirement` and
+`TestSCMNativeSubscription` pass locally, covering the handler, scheduler and a
+read-only native subscription. `TestSCMProcessHandleTermination` verifies forceful
+termination with a real process and retained handle; `TestSCMPendingPIDIsNotTrusted`
+checks that pending-state PIDs are ignored. `TestSCMLifecycle` creates/removes a temporary
+service and tests real start, graceful stop and forced termination; it is skipped
+in the current non-elevated session because service creation is denied. Run it
+from an appropriately privileged Windows test session before treating the full
+SCM lifecycle as verified. `x/sys/windows/svc` was already present in the pinned
+module graph; it is now a direct dependency, with no new module or CGO.
+
+From an elevated PowerShell in the repository, the native test command is:
+
+```powershell
+$env:CGO_ENABLED = '0'
+.\build\windows-amd64\go\bin\go.exe test -v -run '^TestSCM' -count=1 -timeout=60s .
+```
 
 ### Descendant ownership
 
-The common application API is deliberately small: `processOwner.Start/Wait/Close` and `processJob.Kill/Close/Members`. `Wait` uses `exec.Cmd.Wait` to observe direct-child exits, including crashes, without polling. Before the supervisor removes or restarts a worker, it terminates any remaining descendants and drains cleanup. A worker exiting ends that worker instance: daemonizing children does not keep the service alive. Final stdout events are drained, with a 100 ms deadline for a pipe retained by other processes.
+For directly spawned processes the common API is deliberately small: `processOwner.Start/Wait/Close` and `processJob.Kill/Close/Members`. `Wait` uses `exec.Cmd.Wait` to observe direct-child exits, including crashes, without polling. Before the supervisor removes or restarts a worker, it terminates any remaining descendants and drains cleanup. A worker exiting ends that worker instance: daemonizing children does not keep the service alive. Final stdout events are drained, with a 100 ms deadline for a pipe retained by other processes. SCM services use the distinct ownership rules above.
 
 Windows creates one private, non-inheritable Job handle per worker instance, enables `KILL_ON_JOB_CLOSE`, and permits no breakaway. The process is assigned atomically at creation; descendants inherit membership automatically. `TerminateJobObject` terminates the family. Closing ooth also closes its Job handles and terminates their members. Cleanup waits on remaining process handles, checking Job membership to avoid PID reuse mistakes. See [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) and [creation-time Job assignment](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
 
@@ -445,4 +531,4 @@ The supervisor is in `main.go`; platform process utilities are in `job_linux.go`
 
 Integration tests cover cold activation, TCP/Unix listeners, multiple worker processes, idle return to zero, virtual prerequisites, added/reloaded/removed applications, rejected configuration, graceful draining and forced termination. Set `OOTH_TEST_PYTHON` to an interpreter's absolute path to test the Python example as well. The workflow enables that test. The Linux suite also passed `go test -race` locally. Additional [platform probes](tools/probes/README.md) verified actual Linux PID 1 orphan reaping, Windows GUI shutdown and operation without a console or inherited standard handles. These are bounded checks, not a claim of compatibility with every worker/runtime.
 
-Direct dependencies: `sgtdi/fswatcher v1.3.0`, `goccy/go-yaml v1.19.2`, and `gopsutil/v4 v4.26.8`; transitive Go modules are pinned in `go.mod`/`go.sum`. [Canonical Pebble](https://github.com/canonical/pebble) is an architectural reference, not a dependency.
+Direct dependencies: `sgtdi/fswatcher v1.3.0`, `goccy/go-yaml v1.19.2`, `gopsutil/v4 v4.26.8`, and `golang.org/x/sys v0.45.0`; transitive Go modules are pinned in `go.mod`/`go.sum`. [Canonical Pebble](https://github.com/canonical/pebble) is an architectural reference, not a dependency.
