@@ -61,8 +61,8 @@ func TestConfig(t *testing.T) {
 		t.Fatal("accepted dependency cycle")
 	}
 	write(t, filepath.Join(directory, "app2", "ooth.yaml"), "name: db\ncommand: ['db']\nunknown: yes\n")
-	if _, err := Load(path); err == nil {
-		t.Fatal("accepted unknown key")
+	if _, err := Load(path); err != nil {
+		t.Fatal("unknown key should be ignored:", err)
 	}
 }
 
@@ -222,7 +222,7 @@ func TestActivationLifecycle(t *testing.T) {
 				t.Fatal("pool did not scale")
 			}
 			// An invalid atomic update must keep the current listener usable.
-			write(t, appPath, "command: [bad]\nunknown: true\n")
+			write(t, appPath, "command: [bad]\nmax_workers: 0\n")
 			time.Sleep(250 * time.Millisecond)
 			request(t, network, address, "5ms after-rejected-config")
 		})
@@ -365,9 +365,15 @@ func TestPythonWorker(t *testing.T) {
 }
 
 func TestWatchAddReloadRemove(t *testing.T) {
+	for _, pattern := range []string{"app*/ooth.yaml", "app*/**/ooth.yaml"} {
+		t.Run(pattern, func(t *testing.T) { testWatchAddReloadRemove(t, pattern) })
+	}
+}
+
+func testWatchAddReloadRemove(t *testing.T, pattern string) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "ooth.yaml")
-	write(t, path, "watch: ['app*/ooth.yaml']\n")
+	write(t, path, "watch: ['"+pattern+"']\n")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
@@ -377,6 +383,9 @@ func TestWatchAddReloadRemove(t *testing.T) {
 	address := freeAddress(t)
 	app := App{Name: "web", Command: []string{executable, "-test.run=^TestWorkerHelper$"}, Env: map[string]string{"TEST_OOTH_WORKER": "1"}, Listen: Socket{"tcp", address}, MaxWorkers: 1, Concurrency: 1, IdleTimeout: time.Minute, StartTimeout: 3 * time.Second, StopTimeout: time.Second, ScaleDelay: 25 * time.Millisecond}
 	appPath := filepath.Join(directory, "app1", "ooth.yaml")
+	if strings.Contains(pattern, "**") {
+		appPath = filepath.Join(directory, "app1", "nested", "deep", "ooth.yaml")
+	}
 	writeApp(t, appPath, app)
 	first := request(t, "tcp", address, "1ms added")
 	app.Env["RELOAD_MARKER"] = "changed"

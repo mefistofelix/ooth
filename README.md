@@ -45,7 +45,9 @@ resources:
   min_available_memory_percent: 10
 ```
 
-Windows paths may use forward slashes, for example `C:/www/app*/ooth.yaml`. Patterns follow Go's `filepath.Glob`: `*` matches within one directory level; recursive `**` is not supported. Relative paths resolve against the YAML file that contains them. Changes and new matching files are watched with [sgtdi/fswatcher](https://github.com/sgtdi/fswatcher); a five-second rescan also reconciles missed events. YAML uses [goccy/go-yaml](https://github.com/goccy/go-yaml), with unknown fields rejected.
+Windows paths may use forward slashes, for example `C:/www/app*/ooth.yaml`. `*` matches within one directory level; a complete `**` path component matches zero or more levels. For example, `/var/www/**/ooth.yaml` finds both `/var/www/ooth.yaml` and `/var/www/team/site/ooth.yaml`. `?` and character classes retain Go's `filepath.Match` syntax. Recursive discovery does not follow directory symlinks. Relative paths resolve against the YAML file that contains them. Changes and new matching files are watched with [sgtdi/fswatcher](https://github.com/sgtdi/fswatcher); a five-second rescan also reconciles missed events.
+
+YAML uses [goccy/go-yaml](https://github.com/goccy/go-yaml). Both the main configuration and application files ignore unknown fields, including inside their structured settings, so a file may also contain settings for other tools. Known ooth fields still require valid types and values; malformed YAML, duplicate keys and multiple documents are rejected.
 
 On Linux, an optional main-config `cgroup: /sys/fs/cgroup/my-delegation` selects a writable cgroup v2 subtree. Otherwise ooth uses `OOTH_CGROUP_ROOT`, then its current cgroup under `/sys/fs/cgroup`. This setting is ignored on Windows and requires an ooth restart to change. Missing support or permissions produces a warning on stderr and falls back to direct-child supervision; see descendant ownership below.
 
@@ -130,14 +132,15 @@ Each application can select filesystem changes that retire its current processes
 restart_on:
   - glob: config/*.yaml
     events: [create, write, remove, rename]
-  - glob: src/*/*.js
+  - glob: src/**/*.js
   - glob: public/*.php
 ```
 
 This works for init services, inherited-socket workers and ordinary process pools.
 Paths are relative to the **application YAML**, regardless of `directory`;
-absolute paths are also accepted. Matching uses `filepath.Match`: `*` covers one
-path component, with `?` and character classes also supported; `**` is rejected.
+absolute paths are also accepted. Matching uses the same glob syntax as `watch`:
+`*` stays within one component and `**` spans zero or more directory levels.
+For example, `src/**/*.js` matches both `src/main.js` and `src/web/routes/main.js`.
 Rules apply to future files too. Omitted or empty `events` defaults to the four
 shown above. `chmod` is also accepted: Linux reports it separately, while the
 Windows backend reports attribute changes as `write`. Rename may also carry

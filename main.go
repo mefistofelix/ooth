@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -299,12 +300,12 @@ var fileEvents = map[string]fswatcher.EventType{
 
 func (rule RestartRule) matches(event fswatcher.WatchEvent) bool {
 	path := filepath.Clean(event.Path)
-	matched, _ := filepath.Match(rule.Glob, path)
+	matched := matchGlob(rule.Glob, path)
 	// A replaced directory can change every matching file below it without
 	// individual child events, including files created before a new watch is ready.
 	if slices.Contains(event.Types, fswatcher.EventCreate) || slices.Contains(event.Types, fswatcher.EventRemove) || slices.Contains(event.Types, fswatcher.EventRename) {
 		for parent := filepath.Dir(rule.Glob); !matched && filepath.Dir(parent) != parent; parent = filepath.Dir(parent) {
-			matched, _ = filepath.Match(parent, path)
+			matched = matchGlob(parent, path)
 		}
 	}
 	if !matched {
@@ -353,7 +354,7 @@ func Load(path string) (Snapshot, error) {
 		if err != nil {
 			return Snapshot{}, err
 		}
-		matches, err := filepath.Glob(pattern)
+		matches, err := expandGlob(pattern, root)
 		if err != nil {
 			return Snapshot{}, fmt.Errorf("glob %q: %w", pattern, err)
 		}
@@ -542,7 +543,7 @@ func read(path string, target any) error {
 		return err
 	}
 	defer file.Close()
-	decoder := yaml.NewDecoder(file, yaml.Strict())
+	decoder := yaml.NewDecoder(file)
 	if err := decoder.Decode(target); err != nil {
 		// Configuration can contain passwords; do not include YAML source excerpts.
 		return fmt.Errorf("%s: %s", path, yaml.FormatError(err, false, false))
@@ -561,13 +562,59 @@ func resolve(directory, path string) string {
 	return filepath.Join(directory, path)
 }
 
+// A complete ** component matches zero or more directory levels. Other
+// components retain filepath.Match syntax and platform-specific separators.
+func matchGlob(pattern, path string) bool {
+	var match func([]string, []string) bool
+	match = func(pattern, path []string) bool {
+		for len(pattern) > 0 {
+			if pattern[0] == "**" {
+				for index := 0; index <= len(path); index++ {
+					if match(pattern[1:], path[index:]) {
+						return true
+					}
+				}
+				return false
+			}
+			if len(path) == 0 {
+				return false
+			}
+			matched, _ := filepath.Match(pattern[0], path[0])
+			if !matched {
+				return false
+			}
+			pattern, path = pattern[1:], path[1:]
+		}
+		return len(path) == 0
+	}
+	return match(strings.Split(filepath.Clean(pattern), string(filepath.Separator)), strings.Split(filepath.Clean(path), string(filepath.Separator)))
+}
+
+func expandGlob(pattern, root string) ([]string, error) {
+	if !slices.Contains(strings.Split(pattern, string(filepath.Separator)), "**") {
+		return filepath.Glob(pattern)
+	}
+	var matches []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if os.IsNotExist(err) {
+			return nil // A file may disappear between directory reads.
+		}
+		if err != nil {
+			return err
+		}
+		if matchGlob(pattern, path) {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	return matches, err
+}
+
 // Watch the nearest existing directory, so globs also cover future files and
 // atomic replacements instead of following just today's matching inodes.
 func watchRoot(pattern string) (string, error) {
-	if strings.Contains(pattern, "**") {
-		return "", fmt.Errorf("glob %q: use * for one directory level; ** is not supported", pattern)
-	}
-	if _, err := filepath.Match(pattern, ""); err != nil {
+	// path.Match checks the entire pattern even after an unmatched prefix.
+	if _, err := path.Match(filepath.ToSlash(pattern), ""); err != nil {
 		return "", fmt.Errorf("glob %q: %w", pattern, err)
 	}
 	root := pattern

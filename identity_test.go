@@ -157,7 +157,7 @@ func TestIdentityConfigAndErrors(t *testing.T) {
 		t.Fatal("identity fields not decoded")
 	}
 	for _, invalid := range []string{
-		"command: [worker]\nuser: alice\npassword: '" + password + "'\nunknown: 1\n",
+		"command: [worker]\nuser: alice\npassword: '" + password + "'\nuser: duplicate\n",
 		"command: [worker]\npassword: ['" + password + "']\n",
 		"command: [worker]\npassword: '" + password + "\n",
 	} {

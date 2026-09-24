@@ -25,7 +25,7 @@ func TestRestartRules(t *testing.T) {
 	write(t, path, "watch: [app.yaml]\n")
 	appPath := filepath.Join(directory, "app.yaml")
 	for _, invalid := range []string{
-		"- glob: ''", "- glob: '[broken'", "- glob: '**/*.go'",
+		"- glob: ''", "- glob: '[broken'",
 		"- glob: '*.go'\n  events: [not-an-event]",
 	} {
 		write(t, appPath, "command: [worker]\nrestart_on:\n"+invalid+"\n")
