@@ -6,7 +6,7 @@ ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool
 
 An app without `listen` runs as an ordinary process pool. The same minimum, maximum, telemetry, scaling and shutdown rules apply; the program can open its own listener. There is no special reuseport mode in ooth.
 
-This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. Optional Windows SCM integration lets ooth run as a service and control registered services. It does not mount filesystems or configure the machine.
+This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. Optional Windows SCM integration lets ooth run as a service. It does not mount filesystems or configure the machine.
 
 ## Build and run
 
@@ -123,10 +123,10 @@ Expansion errors name the affected field without printing its value.
 | `{{.runtime.requests}}`, `{{.runtime.worker_requests}}` | In-flight requests reported by the generation and by this instance. |
 | `{{.runtime.ready}}`, `{{.runtime.telemetry}}`, `{{.runtime.stopping}}` | Instance state; false where no instance exists. |
 | `{{.runtime.started_ns}}`, `{{.runtime.uptime_ms}}` | Startup timestamp and elapsed startup time; zero before spawning or for app scope. |
-| `{{.runtime.exit_code}}` | Direct process exit code in `post_stop`, otherwise -1; SCM does not expose a POSIX-style exit code here. |
+| `{{.runtime.exit_code}}` | Direct process exit code in `post_stop`, otherwise -1. |
 | `{{.runtime.event}}`, `{{.runtime.scope}}` | `launch` or the action trigger name; `worker` or `app`. |
 
-The same evaluator expands `scm.args` and every string parameter of an action:
+The same evaluator expands every string parameter of an action:
 arguments, environment keys/values, action directory, HTTP URL/method/headers/body,
 Unix transport path, TCP/UDP address/payload and expected text/regexp. Timing,
 numeric expectations and trigger policy remain typed YAML fields. `vars`, the
@@ -221,10 +221,10 @@ and unawaited bindings. `restart` is rejected for stop hooks or `wait: false`.
 | Trigger | Meaning |
 | --- | --- |
 | `pre_start` | Before OS spawn. An awaited failure prevents spawn and applies restart backoff; `on_failure: log` permits it. Reserved starts count toward capacity. |
-| `post_start` | After spawn (SCM: after Running). Awaited hooks must complete before readiness; failure normally retires the instance. |
+| `post_start` | After spawn. Awaited hooks must complete before readiness; failure normally retires the instance. |
 | `readiness` | After the existing `ready` criterion and awaited post-start hooks. Repeats until first success; all awaited checks must pass. |
 | `health` | Starts after initial readiness checks pass, repeats at `interval`, with no overlapping invocation of the same binding. |
-| `pre_stop` | Before sending stdin/OS/SCM graceful stop. Awaited hooks consume the existing `stop_timeout`, never extend it. Failure logs and proceeds; deadline forces termination. |
+| `pre_stop` | Before sending stdin/OS graceful stop. Awaited hooks consume the existing `stop_timeout`, never extend it. Failure logs and proceeds; deadline forces termination. |
 | `post_stop` | After process exit and family cleanup, also after a crash. Awaited hooks complete before shutdown considers that instance fully retired. |
 
 Readiness and health default to `interval: 1s` and `failure_threshold: 3`;
@@ -338,8 +338,7 @@ An app with minimum zero and no fresh demand stays at zero after draining;
 editing a file never wakes an already dormant app. The previous autoscaled
 worker count is not restored automatically. Init services kept alive by
 `min_workers`, `startup` or a dependency start replacements during retirement too.
-An SCM service has one registered instance and waits for its previous instance
-to stop before restarting. Programs owning exclusive resources must release them as part of graceful stop;
+Programs owning exclusive resources must release them as part of graceful stop;
 otherwise their replacement may need the normal startup retry/backoff.
 
 For example, with `min_workers: 0` and `max_workers: 1`, worker A is answering
@@ -600,98 +599,43 @@ The Windows toolchain patch:
 - Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. Visible GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
 - Adds `syscall.SysProcAttr.JobObjects` and passes those handles through `PROC_THREAD_ATTRIBUTE_JOB_LIST` during process creation, before child code can run. Requires Windows 10 / Server 2016 or newer. Job creation, queries and termination live in `job_windows.go`, outside the toolchain patch. No `taskkill`, PowerShell, or shell command is launched by ooth.
 
-Workers without stdin protocol support must handle the OS graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Explicit SCM services use the separate control path below. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
+Workers without stdin protocol support must handle the OS graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
 
-### Optional Windows SCM support
+### Run ooth as a Windows service
 
-To run ooth as an already registered **own-process** Windows service, configure
-its service command line with absolute paths, for example:
+Register ooth as an **own-process** Windows service with an absolute executable
+and config path, for example this service command line:
 
 ```text
 C:\ooth\ooth.exe -service Ooth -config C:\ooth\ooth.yaml -log-file C:\ooth\ooth.log
 ```
 
-`-service` enters the native SCM dispatcher. It reports start-pending until
-ooth has loaded its configuration and bound listeners, then running. SCM stop
-and shutdown requests cancel the supervisor and use its normal dependency-aware
-graceful shutdown and worker timeouts. While shutting down it reports stop-pending
-with progress checkpoints; it reports completion only after the supervisor exits.
-Startup/runtime failures produce a nonzero service exit code. `-log-file` appends
-logs because service processes generally have no useful stderr. Ordinary console
-execution remains the default. Linux rejects `-service`.
+The name passed to `-service` must match the registration. Registration and the
+service account are configured by the administrator; ooth does not install or
+modify its own service registration. Without `-service`, it runs normally in
+the foreground. `-log-file` appends diagnostics to the selected file; choose a
+path writable by the service account.
 
-An application can instead name another **already registered** Windows service:
+`-service` enters the native Windows SCM dispatcher. It reports start-pending
+until ooth has loaded configuration and bound listeners, then running. This
+status describes ooth itself; app readiness is evaluated separately. SCM stop
+and shutdown requests cancel the supervisor and use its ordinary dependency-aware
+graceful shutdown, action hooks and worker timeouts. While draining, ooth reports
+stop-pending with progress checkpoints, and reports stopped only after shutdown
+finishes. Its workers use the same spawning, Job ownership, socket activation
+and stdin/signal stop paths as when ooth runs in the foreground.
 
-```yaml
-name: database
-scm:
-  name: ExampleDatabase
-  args: ['{{.vars.mode}}']
-vars:
-  mode: production
-min_workers: 1
-start_timeout: 30s
-stop_timeout: 15s
-restart_on:
-  - glob: database-config/**/*.yaml
-```
+`TestSCMHostGraceful` verifies pending/running/stopping status and waits for worker
+draining; `TestSCMHostStartupError` checks failed startup. The elevated
+`TestSCMHostLifecycle` registers a temporary ooth service, starts an ordinary
+worker, sends SCM stop and verifies the worker exits gracefully before the host
+stops. The temporary registration is deleted afterward. The test skips if the
+session lacks service-creation permission.
 
-ooth calls `StartService` and `ControlService(STOP)` directly, with no `sc.exe`,
-PowerShell or helper process. `scm.args` are arguments to the registered service's
-ServiceMain, expanded with the existing placeholders; they are not executable
-command-line arguments. Command, environment, working directory and identity
-come from the SCM registration, so ooth rejects their per-app overrides here.
-Socket inheritance and stdout telemetry are unavailable through SCM.
+These host tests passed on Windows amd64 on 2026-09-24 with user-approved UAC
+elevation. Cleanup verification found no remaining temporary service.
 
-SCM running status supplies base readiness; awaited post-start/readiness actions
-can gate it further. Action commands run as ooth, not the SCM service account.
-The normal `startup`, `min_workers`,
-dependencies, crash backoff and `restart_on` rules apply, with `max_workers: 1`.
-There is no request-based scaling or activation by a parent socket. The same
-SCM name cannot appear in two app definitions. A service already active at the
-first start attempt is left alone and reported as an error; ooth does not take
-ownership of an instance someone else started. Configure SCM recovery separately
-so it does not compete with ooth's restart policy.
-
-State changes use native
-[service subscriptions](https://learn.microsoft.com/en-us/windows/win32/services/subscribeservicechangenotifications),
-not periodic enumeration. Stop timeout terminates the retained service process
-handle, protecting against PID reuse. Only own-process services are accepted:
-killing a shared service host would also kill unrelated services. A PID may not
-yet be valid during start-pending; a force request is retained and applied
-when a running/paused state provides a valid PID. Until then forced termination
-cannot be guaranteed: SCM does not guarantee a valid PID in pending states,
-as documented for [QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex).
-SCM services are created by Windows outside
-ooth's worker Job, so this path does not claim Job-based descendant ownership.
-ooth acts as a service control client: `StartService` asks the system SCM to
-launch the registered executable, and `ControlService` sends its stop request.
-This is not a private SCM for ordinary child processes. A service executable's
-[`StartServiceCtrlDispatcher`](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-startservicectrldispatcherw)
-connects to the Windows SCM; the documented interface does not select ooth as
-an alternative dispatcher endpoint.
-
-The caller needs service query/start/stop rights and terminate access to the
-service process. ooth does not register services, change accounts or recovery
-settings, elevate privileges, or convert a console executable into an SCM service.
-Registration is an administrator/deployment step; the service executable must
-already implement the SCM protocol.
-
-`TestSCMHostGraceful`, `TestSCMHostStartupError`, `TestSCMRetirement` and
-`TestSCMNativeSubscription` pass locally, covering the handler, scheduler and a
-read-only native subscription. `TestSCMProcessHandleTermination` verifies forceful
-termination with a real process and retained handle; `TestSCMPendingPIDIsNotTrusted`
-checks that pending-state PIDs are ignored. `TestSCMLifecycle` creates/removes a temporary
-service and tests real start, graceful stop and forced termination. On 2026-09-24
-the entire `TestSCM` group passed in a local Windows amd64 session elevated through
-user-approved UAC, including both native lifecycle cases. Cleanup verification
-found no remaining temporary service. This covers the real service host and
-controller; it does not establish live SCM readiness/action-hook integration.
-The lifecycle test still skips in sessions without service-creation permission.
-`x/sys/windows/svc` was already present in the pinned
-module graph; it is now a direct dependency, with no new module or CGO.
-
-From an elevated PowerShell in the repository, the native test command is:
+From an elevated PowerShell in the repository:
 
 ```powershell
 $env:CGO_ENABLED = '0'
@@ -700,7 +644,7 @@ $env:CGO_ENABLED = '0'
 
 ### Descendant ownership
 
-For directly spawned processes the common API is deliberately small: `processOwner.Start/Wait/Close` and `processJob.Kill/Close/Members`. `Wait` uses `exec.Cmd.Wait` to observe direct-child exits, including crashes, without polling. Before the supervisor removes or restarts a worker, it terminates any remaining descendants and drains cleanup. A worker exiting ends that worker instance: daemonizing children does not keep the service alive. Final stdout events are drained, with a 100 ms deadline for a pipe retained by other processes. SCM services use the distinct ownership rules above.
+For directly spawned processes the common API is deliberately small: `processOwner.Start/Wait/Close` and `processJob.Kill/Close/Members`. `Wait` uses `exec.Cmd.Wait` to observe direct-child exits, including crashes, without polling. Before the supervisor removes or restarts a worker, it terminates any remaining descendants and drains cleanup. A worker exiting ends that worker instance: daemonizing children does not keep the service alive. Final stdout events are drained, with a 100 ms deadline for a pipe retained by other processes.
 
 Windows creates one private, non-inheritable Job handle per worker instance, enables `KILL_ON_JOB_CLOSE`, and permits no breakaway. The process is assigned atomically at creation; descendants inherit membership automatically. `TerminateJobObject` terminates the family. Closing ooth also closes its Job handles and terminates their members. Cleanup waits on remaining process handles, checking Job membership to avoid PID reuse mistakes. See [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) and [creation-time Job assignment](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
 

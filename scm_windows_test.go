@@ -7,8 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -72,76 +73,26 @@ func TestSCMHostStartupError(t *testing.T) {
 	}
 }
 
-func TestSCMNativeSubscription(t *testing.T) {
-	handle, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer windows.CloseServiceHandle(handle)
-	name, _ := windows.UTF16PtrFromString("EventLog")
-	service, err := windows.OpenService(handle, name, windows.SERVICE_QUERY_STATUS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer windows.CloseServiceHandle(service)
-	unsubscribe, err := subscribeSCM(service, make(chan struct{}, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	unsubscribe() // Read-only: do not control an existing machine service.
-	if _, err := openSCM(fmt.Sprintf("ooth-missing-%d", os.Getpid())); !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		t.Fatalf("missing service: %v", err)
-	}
-}
-
-func TestSCMProcessHandleTermination(t *testing.T) {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestWorkerHelper$")
-	cmd.Env = append(os.Environ(), "TEST_OOTH_WORKER=1", "TEST_OOTH_VIRTUAL=1")
-	cmd.NewProcessGroup = true
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
-	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, uint32(cmd.Process.Pid))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer windows.CloseHandle(handle)
-	if err := terminateSCMProcess(handle); err != nil {
-		t.Fatal(err)
-	}
-	if state, err := windows.WaitForSingleObject(handle, 3000); err != nil || state != windows.WAIT_OBJECT_0 {
-		t.Fatalf("forced process did not exit: %v %v", state, err)
-	}
-	if err := terminateSCMProcess(handle); err != nil {
-		t.Fatal("already exited retained handle:", err)
-	}
-}
-
-func TestSCMPendingPIDIsNotTrusted(t *testing.T) {
-	control := &scmControl{}
-	for _, state := range []svc.State{svc.StartPending, svc.StopPending, svc.Stopped} {
-		// Even a nonzero PID in these states is not valid according to SCM.
-		if err := control.capture(svc.Status{State: state, ProcessId: uint32(os.Getpid())}); err != nil || control.process != 0 {
-			t.Fatalf("captured a pending/stopped PID: %v", err)
-		}
-	}
-}
-
-// Run from an elevated test session to exercise the actual SCM dispatcher and
-// controller together. The temporary service is always removed after the test.
-func TestSCMLifecycle(t *testing.T) {
+// Test-only SCM client: production ooth implements just the service host.
+// Run elevated to register a temporary host and verify its ordinary child drains.
+func TestSCMHostLifecycle(t *testing.T) {
 	handle, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT|windows.SC_MANAGER_CREATE_SERVICE)
 	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-		t.Skip("native SCM lifecycle requires permission to create a temporary Windows service")
+		t.Skip("native SCM host test requires permission to create a temporary Windows service")
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer windows.CloseServiceHandle(handle)
 	directory := t.TempDir()
-	path := filepath.Join(directory, "empty.yaml")
-	write(t, path, "watch: [missing-app-*.yaml]\n")
+	path := filepath.Join(directory, "ooth.yaml")
+	marker := filepath.Join(directory, "worker")
+	write(t, path, "watch: [app.yaml]\n")
+	app := restartApp("")
+	app.RestartOn = nil
+	app.Command = []string{os.Args[0], "-test.run=^TestSCMWorkerHelper$"}
+	app.Env = map[string]string{"TEST_SCM_MARKER": marker}
+	writeApp(t, filepath.Join(directory, "app.yaml"), app)
 	name := fmt.Sprintf("ooth-test-%d-%d", os.Getpid(), time.Now().UnixNano())
 	registered, err := (&mgr.Mgr{Handle: handle}).CreateService(name, os.Args[0], mgr.Config{StartType: mgr.StartManual}, "-test.run=^TestSCMHelper$", "--", name, path)
 	if err != nil {
@@ -153,59 +104,94 @@ func TestSCMLifecycle(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	for _, force := range []bool{false, true} {
-		t.Run(fmt.Sprint(force), func(t *testing.T) {
-			control, err := openSCM(name)
+	var process windows.Handle
+	defer func() {
+		if process != 0 {
+			// Failure cleanup is limited to the retained temporary host handle.
+			if state, _ := windows.WaitForSingleObject(process, 0); state != windows.WAIT_OBJECT_0 {
+				windows.TerminateProcess(process, 1)
+				windows.WaitForSingleObject(process, 5000)
+			}
+			windows.CloseHandle(process)
+		}
+	}()
+	waitState := func(expected svc.State) svc.Status {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			status, err := registered.Query()
 			if err != nil {
 				t.Fatal(err)
 			}
-			ready := make(chan struct{}, 1)
-			done := make(chan error, 1)
-			go func() {
-				err, cleanupErr := control.run(nil, func(status svc.Status) {
-					if status.State == svc.Running {
-						select {
-						case ready <- struct{}{}:
-						default:
-						}
-					}
-				}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-				done <- errors.Join(err, cleanupErr)
-				close(done)
-			}()
-			t.Cleanup(func() {
-				control.Stop()
-				control.Kill()
-				select {
-				case <-done:
-				case <-time.After(15 * time.Second):
-					t.Error("temporary SCM service cleanup timed out")
-				}
-			})
-			select {
-			case <-ready:
-			case err := <-done:
-				t.Fatalf("SCM startup: %v", err)
-			case <-time.After(15 * time.Second):
-				t.Fatal("SCM startup timed out")
+			if status.State == expected {
+				return status
 			}
-			if force {
-				if err := control.Kill(); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				control.Stop()
-			}
-			select {
-			case err := <-done:
-				if !force && err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("SCM stop timed out")
-			}
-		})
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("SCM host did not reach state %v", expected)
+		return svc.Status{}
 	}
+	if err := registered.Start(); err != nil {
+		t.Fatal(err)
+	}
+	status := waitState(svc.Running)
+	process, err = windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, status.ProcessId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workerPID int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(marker)
+		if err == nil {
+			workerPID, _ = strconv.Atoi(string(data))
+			if workerPID > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if workerPID == 0 {
+		t.Fatal("SCM host did not start its ordinary worker")
+	}
+	worker, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(workerPID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(worker)
+	if _, err := registered.Control(svc.Stop); err != nil {
+		t.Fatal(err)
+	}
+	status = waitState(svc.Stopped)
+	if status.Win32ExitCode != 0 || status.ServiceSpecificExitCode != 0 {
+		t.Fatalf("SCM host exit status: %v", status)
+	}
+	if _, err := os.Stat(marker + ".stopped"); err != nil {
+		t.Fatal("SCM host did not gracefully stop its worker:", err)
+	}
+	if state, err := windows.WaitForSingleObject(worker, 0); err != nil || state != windows.WAIT_OBJECT_0 {
+		t.Fatal("SCM host stopped before its worker exited")
+	}
+	if state, err := windows.WaitForSingleObject(process, 5000); err != nil || state != windows.WAIT_OBJECT_0 {
+		t.Fatal("SCM host did not exit")
+	}
+}
+
+func TestSCMWorkerHelper(t *testing.T) {
+	marker := os.Getenv("TEST_SCM_MARKER")
+	if marker == "" {
+		return
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	testWorkerControl(cancel)
+	if err := WriteEvent(os.Stdout, Event{Type: "ready", Time: time.Now().UnixNano()}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, marker, strconv.Itoa(os.Getpid()))
+	<-ctx.Done()
+	write(t, marker+".stopped", "drained")
+	os.Exit(0)
 }
 
 func TestSCMHelper(t *testing.T) {
