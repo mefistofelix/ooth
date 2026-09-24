@@ -11,6 +11,9 @@ http://{{.Address}} {
     handle /health {
         respond "ready" 200
     }
+    handle /ws {
+        reverse_proxy {{.Python}}
+    }
     handle_path /python/* {
         reverse_proxy {{.Python}} {
             transport http {
@@ -22,6 +25,7 @@ http://{{.Address}} {
         reverse_proxy {{.Node}} {
             transport http {
                 versions h2c
+                {{if .FreshConnections}}keepalive off{{end}}
             }
         }
     }

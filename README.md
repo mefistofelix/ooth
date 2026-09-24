@@ -8,11 +8,13 @@ This is an experimental nucleus, not a replacement for all of systemd. It superv
 
 ## Build and run
 
-The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. An additional inherited handle keeps stdin usable on both OSes. A Windows-only experimental FFI hook connects three native HTTP/1.1/h2c servers to the same inherited listener without recompiling PHP. It uses a private ABI and creates an unused temporary listener; it is not a production worker adapter. The Linux release lacks FFI, so its additional-handle test covers async accept only.
+The [worker lifecycle matrix](tools/probes/runtime/README.md) uses real ooth activation, request telemetry, growth, idle zero, reactivation and graceful draining, directly and through Caddy/Nginx. Node, Bun and Deno serve HTTP/1.1 and h2c; Python and Socketify serve HTTP/1.1. WebSocket upgrade/echo/close tests cover the JavaScript workers and Socketify. These are bounded integration tests, not performance certification.
 
-The [Socketify ctypes experiment](tools/probes/socketify/README.md) also passed on Linux and Windows: three Python workers use the real Socketify HTTP/1.1 server on an extra inherited listener, and remaining workers keep serving after one closes normally. It reinitializes an internal uSockets poll after closing a temporary listener, requires pinned native binaries, and needs no C/C++ compilation. It remains an experimental adapter without telemetry or certified request draining.
+The [Socketify ctypes adapter](tools/probes/socketify/README.md) uses the actual native HTTP/1.1 and WebSocket server. Its protocol mode supplies request events and stdin stop, keeping handlers alive after closing the listener. It reinitializes an internal uSockets poll after closing a temporary listener, requires pinned native binaries, and needs no C/C++ compilation.
 
-The [Node/Bun/Deno experiments](tools/probes/javascript/README.md) passed shared-listener HTTP/1.1, ordinary stdin, command-based shutdown and active-response draining on both OSes. Node uses a private binding on Windows. Bun uses its fd-capable TCP server on Linux and an FFI accept thread on Windows, feeding its HTTP compatibility server. Deno Windows uses FFI Winsock accept and adopts the connected sockets into its HTTP compatibility server; direct listener adoption still fails. These runtime adapters are experimental.
+The [JavaScript adapters](tools/probes/javascript/README.md) use a private binding for Node on Windows, Bun's fd-capable TCP server on Linux and FFI accept thread on Windows, and FFI Winsock accept for Deno Windows. They feed the runtimes' HTTP compatibility servers; Deno's direct Windows listener adoption still fails. The bounded WebSocket fixture uses the HTTP upgrade event. These runtime adapters remain experimental.
+
+[TrueAsync Windows](tools/probes/trueasync/README.md) also has an ooth protocol worker using its built-in HTTP/1.1, h2c and WebSocket server through a private FFI hook. The released Linux binary is static and lacks FFI, so native HTTP-server adoption remains blocked there; only async accept is verified. The user chose no runtime recompilation. Stock PHP-CGI remains FastCGI without telemetry, with its existing Windows launcher.
 
 ```sh
 bash ./build.sh
@@ -141,7 +143,45 @@ The first demand for `web` activates `database` and `cache` together. `web` star
 
 Virtual services have `max_workers: 1`. They remain running while needed, then stop after their idle timeout. Losing a prerequisite stops dependent workers; demand reactivates the dependency graph. Supervisor shutdown drains dependents before prerequisites. The scheduler does not require unrelated branches to wait for one another.
 
-## Worker convention
+## Generic worker protocol: spawn, environment and stdio
+
+The convention is language-independent and requires no ooth client library.
+ooth starts a foreground process, supplies an already-listening socket, observes
+its exit through the operating system, and optionally reads its request events.
+Workers accept and handle traffic directly. They must not bind a replacement
+socket, close the supervisor's copy, or daemonize away from the managed process.
+
+### Environment and inherited listener
+
+| Variable | Value and meaning |
+| --- | --- |
+| `OOTH_WORKER` | `1` for a process started by ooth, including virtual services. |
+| `OOTH_LISTEN_HANDLE` | Decimal integer identifying the extra inherited listener: an fd on Linux, a native SOCKET on Windows. Absent for virtual services and legacy stdin handoff. |
+| `OOTH_CONCURRENCY` | Decimal configured capacity used by ooth's occupancy calculation. A sizing hint, not an enforced semaphore or a worker count. |
+
+`socket_handoff: env` is the default on both systems. Parse the supplied integer
+without truncating a native handle. Linux currently assigns fd 3 by default;
+workers should read the variable rather than assume that number. An explicit
+Linux `socket_handoff: 7`, for example, assigns fd 7 and advertises `7`.
+Windows native handles do not imply CRT descriptor slots such as 3 or 7.
+
+The number alone does not transfer or reopen a socket: inheritance happens at
+process creation. Each child owns its inherited reference and may close that
+reference when retiring. Other workers and ooth retain their own references.
+With `socket_handoff: stdin` (or `0`), adopt fd 0 on Linux or the native
+`STD_INPUT_HANDLE` on Windows instead; no environment handle or stdin command
+is supplied for that listener. Configuration cannot override `OOTH_*` variables.
+
+### Input and output channels
+
+| Channel | Direction | Use |
+| --- | --- | --- |
+| Extra listener | Webserver/client → worker | Connections and application traffic; ooth does not read them. |
+| stdin | ooth → worker | Line-based stop command after handshake, when stdin is free. With legacy handoff, stdin is the listener instead. |
+| stdout | Worker → ooth | First-line protocol detection, then request events; otherwise ordinary process output. |
+| stderr | Worker → operator | Diagnostics and application logs; never protocol events. |
+
+### Startup and request events
 
 1. Read the inherited listener number from `OOTH_LISTEN_HANDLE`: a file descriptor on Linux or native SOCKET on Windows. Adopt it using the runtime's socket API. With explicit `socket_handoff: stdin`, recover fd 0 / `STD_INPUT_HANDLE` instead.
 2. To opt into request telemetry, make the first stdout line the `ready` handshake below. This detection is independent of the configured readiness gate. Send logs to stderr after opting in.
@@ -156,11 +196,50 @@ v=1 event=end ts=1790193600002000000 id=42 duration_ns=1000000
 
 The first complete stdout line must be a valid version-1 `ready` event to enable telemetry. Otherwise stdout is forwarded to ooth's stderr as ordinary output for that worker's lifetime, including any later protocol-looking lines. A silent worker remains supervised without telemetry. Without the handshake there is no request-based growth, idle shrinking or request watchdog; configured minimum workers, cold activation, crash restart and shutdown still work. Virtual dependencies can still stop when no longer required. This default needs no worker changes; `ready: event` opts into the stricter readiness requirement described above.
 
+Emit `ready` exactly once after the listener and handler are initialized. No
+banner or log line may precede it. Readiness gates (`started`, `event`, endpoint)
+remain separate from this per-process protocol negotiation.
+
+| Event | Required fields | Rule |
+| --- | --- | --- |
+| `ready` | `v=1 event=ready ts=…` | First complete stdout line; opts into telemetry and, with free stdin, stop commands. |
+| `start` | `v=1 event=start ts=… id=…` | Begin one request; ID must not already be active in that process. |
+| `end` | `v=1 event=end ts=… id=… duration_ns=…` | Finish that active request, including an aborted/error completion; duration is nonnegative. |
+
+Different requests may overlap and finish in any order. IDs are local to the
+worker and may be reused after their end event. Emit a complete line followed by
+LF, flush it promptly, and serialize concurrent writers. Version 1 has no extra
+status fields, acknowledgements, heartbeats, or accept/queue timestamps.
+
+For ordinary HTTP, one pair describes one request, not a whole keepalive
+connection; each HTTP/2 stream has its own pair. The WebSocket examples instead
+use one pair for the session lifetime, including time between messages, so an
+open session prevents idle retirement. Echo messages are not additional requests.
+This is an application convention using the same existing events; adjust
+`concurrency` and any request timeout for long-lived sessions.
+
 No JSON or escaping. Fields are space-separated `key=value` pairs; values are printable ASCII without spaces or `=`. Request IDs are unique among active requests within one worker. `ts` is Unix time in nanoseconds; `duration_ns` is elapsed request time in nanoseconds, preferably measured with a monotonic clock. Supervisor deadlines use its own monotonic clock, so worker clock changes cannot extend them. After an accepted handshake, unknown/duplicate fields, oversized lines (4096-byte limit), invalid event order, and a broken event stream stop that worker and enter the restart policy. Ordinary output has no protocol line-length limit.
+
+### Graceful stop and process exit
+
+The command from ooth to a protocol worker is:
+
+```text
+v=1 event=stop ts=1790193601000000000
+```
 
 ooth sends exactly one stop line on the worker's stdin pipe **only after accepting its stdout handshake**. The handshake now opts into both telemetry and stdin stop handling when stdin is available; this also works for virtual services. ooth sends no simultaneous signal after a successful write. Without a handshake, with listener-on-stdin, or if the pipe write fails, it uses the platform's graceful signal/notification. In either path `stop_timeout` bounds draining and then forces termination. This control protocol lives in `main.go`, not the Go toolchain patch.
 
-The environment contains `OOTH_WORKER=1`, `OOTH_CONCURRENCY` and, for additional listener handles, `OOTH_LISTEN_HANDLE`. Configuration cannot override `OOTH_*`. No ooth library is needed in the worker. See [examples/worker.py](examples/worker.py). Stock PHP-CGI uses `socket_handoff: stdin` and emits no ooth handshake; activation and supervision work, but request-based scaling and idle detection do not. PHP-CGI's `-b` creates a listener rather than importing an environment-provided handle; `FPM_SOCKETS` belongs to PHP-FPM. See the [CGI audit](tools/probes/proxy/README.md#php-cgi-listener-selection).
+On stop, close the worker's listener, refuse new work, finish its active requests,
+emit their final `end` lines, flush stdout and exit. The WebSocket examples send
+1001 Going Away and complete the close exchange. No `stopped` event exists: the
+OS process-exit notification is authoritative. Keeping a pipe or wait thread
+alive after draining can still reach the forceful timeout. The worker may also
+exit or crash without a command; ooth detects that independently of the protocol
+and applies its restart/demand policy. An inherited listener alone does not make
+an unmodified runtime capable of interpreting telemetry or graceful commands.
+
+See [examples/worker.py](examples/worker.py) for a minimal implementation and the [runtime matrix](tools/probes/runtime/README.md) for HTTP and WebSocket adapters. Stock PHP-CGI uses `socket_handoff: stdin` and emits no ooth handshake; activation and supervision work, but request-based scaling and idle detection do not. PHP-CGI's `-b` creates a listener rather than importing an environment-provided handle; `FPM_SOCKETS` belongs to PHP-FPM. See the [CGI audit](tools/probes/proxy/README.md#php-cgi-listener-selection).
 
 ## Platform details
 
@@ -209,6 +288,8 @@ The implementation is in [`tools/patchgo/patches/epoll_windows.txt`](tools/patch
 `epoll_test.go` exercises readiness without consuming traffic, one-shot rearming, level triggering, pending MOD/DEL/re-add, shutdown cancellation, connection writability/half-close and 128 idle listeners without per-socket goroutine growth. Run `go test -run '^$' -bench BenchmarkEpollIdleListeners -benchmem .` with the dedicated compiler for an idle-queue microbenchmark; it is not an application-throughput comparison.
 
 ## Development status
+
+The [stack findings](tools/probes/runtime/FINDINGS.md) record connection reuse, accept distribution, runtime adoption and shutdown behavior, with reproduction paths and explicit unresolved limits. In particular, a growing pool does not redistribute streams on an existing HTTP/2 connection. The lifecycle fixtures deliberately exercise fresh connections; the pressure experiments retain them to expose that limitation.
 
 The opt-in [pressure experiments](tools/probes/pressure/README.md) compare listener notifications, accept observations, request activity and client latency under open-loop load. They include Go/Python/Node/PHP, fixed and growing pools, and Caddy/Nginx upstreams. Generated configurations and raw CSV traces stay under `build/`; the fixtures, analyzer and aggregate results are versioned. These measurements do not change the scaling policy or add events to the worker protocol.
 

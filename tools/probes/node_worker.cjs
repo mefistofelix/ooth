@@ -1,4 +1,4 @@
-// Experimental ooth integration fixture, not a supported Node adapter.
+// Experimental ooth integration fixture for Node, Bun and Deno.
 // Windows uses the private tcp_wrap binding; only legacy stdin needs node:ffi.
 const fs = require('node:fs');
 const http = require('node:http');
@@ -22,6 +22,7 @@ const handleRequest = (request, response) => {
     // Rotate test h2c sessions so later requests exercise newly spawned
     // workers; existing multiplexed connections stay with their acceptor.
     if (session) session.close();
+    else if (process.versions.deno) request.socket.destroySoon();
   });
   response.writeHead(200, h2c ? { 'Content-Type': 'text/plain' } : { Connection: 'close', 'Content-Type': 'text/plain' });
   response.flushHeaders();
@@ -30,6 +31,12 @@ const handleRequest = (request, response) => {
   }, Number(request.url.slice(1)) || 0);
 };
 const server = h2c ? http2.createServer({ settings: { maxConcurrentStreams: 1 } }, handleRequest) : http.createServer(handleRequest);
+const stopWebSockets = !h2c ? require('./javascript/websocket.cjs')(server, event, () => ++sequence) : () => {};
+const windows = process.platform === 'win32';
+const owner = windows && process.versions.bun ? require('./javascript/bun-windows.cjs')(server)
+  : windows && process.versions.deno ? require('./javascript/deno-windows.cjs')(server)
+  : process.versions.bun ? require('node:net').createServer(socket => server.emit('connection', socket))
+  : server;
 const sessions = new Set();
 server.on('session', session => {
   sessions.add(session);
@@ -39,6 +46,7 @@ server.on('error', error => {
   console.error(error);
   process.exitCode = 1;
 });
+if (owner !== server) owner.on('error', error => { throw error; });
 
 let stopping = false;
 let control;
@@ -46,11 +54,14 @@ function stop() {
   if (stopping) return;
   stopping = true;
   control?.close();
-  server.close(error => {
+  stopWebSockets();
+  owner.close(error => {
     if (error) throw error;
     if (process.env.TEST_NODE_STOPFILE) {
       fs.appendFileSync(process.env.TEST_NODE_STOPFILE, `${process.pid}\n`);
     }
+    // The FFI adapters retain a native wait thread until process exit.
+    if (owner !== server) setImmediate(() => process.stdout.write('', () => process.exit(0)));
   });
   for (const session of sessions) session.close();
 }
@@ -58,4 +69,4 @@ process.on('SIGINT', stop);
 process.on(process.platform === 'win32' ? 'SIGBREAK' : 'SIGTERM', stop);
 
 control = watchStop(stop);
-server.listen(listenOptions(), () => event('ready'));
+owner.listen(owner === server ? listenOptions() : { fd: Number(process.env.OOTH_LISTEN_HANDLE) }, () => event('ready'));

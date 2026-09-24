@@ -19,10 +19,22 @@ amd64/WSL2 (CPython 3.12.3). On each platform:
 - Workers exit successfully after an OS interrupt. After closing one worker's
   listener, the surviving workers still serve requests through their copies.
 
-This does not certify active-request draining, telemetry, autoscaling, TLS, Unix
-sockets, HTTP/2 or proxy integration. The fixture uses a synchronous route and
-HTTP/1.1; it does not supply h2c. No production config/default or Go dependency
-changed. Test-only Python dependencies and native libraries stay under `build/`.
+That original extra-handle probe remains unchanged in scope. With
+`TEST_OOTH_PROTOCOL=1`, the same worker now implements ready/start/end telemetry,
+stdin stop and asynchronous HTTP handlers. The [common lifecycle matrix](../runtime/README.md)
+verifies actual ooth cold activation, growth, responses from both PIDs, idle zero,
+reactivation and active-request draining, directly and through Caddy/Nginx on both
+OSes. Native Socketify WebSockets pass upgrade, text/binary echo, ping/pong,
+survival beyond idle TTL and client/server close exchanges. One event pair spans
+each WebSocket session.
+
+Stop closes the listener before stopping the event loop, allowing outstanding
+handlers to finish. `/busy600` deliberately blocks the loop during the growth
+probe; normal delay and shutdown requests are asynchronous. The probe connects
+while the old worker is still busy and does not assume fair serial accepts.
+See [distribution findings](../runtime/FINDINGS.md). TLS, Unix sockets and HTTP/2
+remain outside this adapter; it does not supply h2c. No production configuration,
+Go dependency or native binary changed. Test-only dependencies stay under `build/`.
 
 ## How the workaround works
 

@@ -56,6 +56,7 @@ module.exports = function acceptInto(server) {
       const error = handle.open(Number(socket));
       if (error) throw new Error(`connected TCPWrap.open: ${error}`);
       const connection = new net.Socket({ handle, readable: true, writable: true });
+      connection.on('error', error => { if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') owner.emit('error', error); });
       connections.add(connection);
       connection.once('close', () => { connections.delete(connection); finish(); });
       server.emit('connection', connection);

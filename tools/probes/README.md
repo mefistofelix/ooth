@@ -1,6 +1,6 @@
 # Manual platform probes
 
-The [Caddy/Nginx proxy suite](proxy/README.md) includes committed worker sources, ooth/webserver templates and local preparation commands for Python HTTP, Node h2c and stock PHP FastCGI. It also preserves the Windows PHP detection incompatibility and the explicit launcher needed for that runtime's stdio convention.
+The [Caddy/Nginx proxy suite](proxy/README.md) includes committed worker sources, ooth/webserver templates and local preparation commands for Python HTTP, Node h2c and stock PHP FastCGI. It also preserves the Windows PHP detection incompatibility and the explicit launcher needed for that runtime's stdio convention. The [common runtime matrix](runtime/README.md) extends the full ooth lifecycle to Bun, Deno, Socketify and Windows TrueAsync, with HTTP/1.1, h2c and WebSockets where supported. [Stack findings](runtime/FINDINGS.md) record distribution, shutdown and adoption limits; the root [worker protocol](../../README.md#generic-worker-protocol-spawn-environment-and-stdio) documents the common environment/stdin/stdout convention.
 
 Run these from the repository root after `bash ./build.sh`. They use the dedicated patched compiler and OS/interpreter facilities; the handoff comparison also uses a separate stock compiler. The Go files have `ignore` build tags because they are standalone probes, not application packages.
 
@@ -111,7 +111,7 @@ On Linux the same fixture uses public `server.listen({fd: Number(process.env.OOT
 OOTH_TEST_NODE=/absolute/path/to/node ./build/linux-amd64/go/bin/go test -run '^TestNodeWorker$' -v -timeout 30s .
 ```
 
-The lifecycle test passed locally on Windows amd64 and Linux amd64 in WSL, with Node 26.10.0. It is skipped unless `OOTH_TEST_NODE` is set. The runtime is a test tool, not an ooth dependency. Local portable archives were downloaded from nodejs.org into ignored `build/runtime-node/` and verified against the official `SHASUMS256.txt`; no system installation or CI trigger was changed. The runtime execution checks here cover Node, not Bun or Deno.
+The lifecycle test passed locally on Windows amd64 and Linux amd64 in WSL, with Node 26.10.0. It is skipped unless `OOTH_TEST_NODE` is set. The runtime is a test tool, not an ooth dependency. Local portable archives were downloaded from nodejs.org into ignored `build/runtime-node/` and verified against the official `SHASUMS256.txt`; no system installation or CI trigger was changed. This original test is Node-only; the later common matrix also runs the shared worker with Bun and Deno on both OSes.
 
 Source audit:
 

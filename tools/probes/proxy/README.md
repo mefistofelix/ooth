@@ -14,6 +14,14 @@ The suite uncovered and now covers an idle-retirement bug: draining socket worke
 
 ## Tested versions and protocol details
 
+The [extended runtime matrix](../runtime/README.md) also runs Bun, Deno,
+Socketify and Windows TrueAsync through these proxy templates. `/ws` uses an
+HTTP/1.1 upgrade tunnel. Its optional Caddy `FreshConnections` setting disables
+h2c upstream keepalive to exercise newly spawned workers; `TestProxyStack` does
+not enable that setting, and the pressure suite keeps persistent sessions.
+See [FINDINGS.md](../runtime/FINDINGS.md) for observed worker distribution,
+shutdown details and explicitly unresolved cases.
+
 Local Linux and Windows checks used Caddy 2.11.4, Nginx 1.30.5, Node 26.10.0, the local Python interpreters, and PHP 8.3.6 on Ubuntu / 8.4.26 on Windows. The preparation scripts pin downloads and verify SHA-256; the Ubuntu PHP package is checked against the configured signed apt repository metadata. No global runtime or package installation is performed. Linux preparation requires Ubuntu 24.04 amd64, `curl`, `tar`, a C compiler, `make`, `apt-get` and `dpkg-deb`, plus the runtime libraries required by that Ubuntu PHP package. Windows PHP requires the corresponding Visual C++ runtime. Other architectures can use externally supplied compatible binaries.
 
 Caddy documents its [h2c upstream transport](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport). Nginx requires a version supporting [`proxy_http_version 2`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version), added in 1.29.4. These tests use HTTP/1.1 from client to proxy and h2c from proxy to Node; TLS and public listeners are unnecessary.

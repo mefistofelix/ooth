@@ -18,8 +18,15 @@ a complete HTTP/1.1 response body identifying every new worker. Workers read an
 ordinary stdin line before announcing readiness. The test then sends the
 line-based stop command, checks clean process exits, verifies survivors still
 accept, and stops the last worker with a response body pending to check draining.
-These fixtures do not claim HTTP/2, Unix sockets, full autoscaling/proxy
-certification, or the peak performance of the runtimes' native server APIs.
+This original extra-handle probe covers HTTP/1.1 and process handoff only.
+The newer [TestRuntimeLifecycle matrix](../runtime/README.md) uses the shared
+`../node_worker.cjs` with Node, Bun and Deno on both OSes: actual ooth activation,
+telemetry, growth, idle zero, reactivation and active-request draining, over
+HTTP/1.1 and h2c, directly and through Caddy/Nginx. Its HTTP/1.1 cases also check
+WebSocket upgrade, text/binary echo, ping/pong and both close directions.
+The JS WebSocket echo is a bounded test fixture on the HTTP upgrade event, not
+a native Bun.serve/Deno.upgradeWebSocket test or a general WebSocket library.
+Unix sockets and peak performance remain outside these fixtures.
 
 The separate `DENO_DIRECT` case preserves the **known negative result** for
 direct listener import. Public `http.Server.listen({fd: nativeHandle})` also failed in
@@ -33,8 +40,11 @@ revisit it when changing Deno.
 Node's extra-handle path no longer needs FFI: `listener.cjs` reads the native
 number from the environment and calls its private TCPWrap binding. FFI remains
 only for the older, explicit stdin experiment. The separate `TestNodeWorker`
-and Caddy/Nginx suites exercise Node telemetry, cold activation, scaling, h2c,
-idle shutdown and active-request draining through the supervisor.
+and the common runtime matrix exercise telemetry, cold activation, scaling,
+h2c, idle shutdown and active-request draining through the supervisor. The
+shared worker treats accepted-connection resets as peer failures, explicitly
+drains/closes Deno's injected HTTP/1.1 connection, and lets close callbacks and
+stdout flush before adapter exit. See the [stack findings](../runtime/FINDINGS.md).
 
 Bun's `http.Server.listen({fd})` does not adopt the supplied listener: its
 implementation constructs `Bun.serve` options from address/port/path, so the

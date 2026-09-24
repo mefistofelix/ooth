@@ -1,9 +1,20 @@
 # TrueAsync 0.10.0 compatibility audit
 
-The requested target is TrueAsync's built-in HTTP/1.1 + HTTP/2 server adopting
-ooth's listener on stdin, one PHP thread with coroutines, request telemetry and
-graceful shutdown. **This integration is not complete with the released binary.**
-Do not use the independent control listener as a replacement for activation.
+The target is TrueAsync's built-in HTTP/1.1 + HTTP/2 server adopting ooth's
+listener, one PHP server thread with coroutines, request telemetry and graceful
+shutdown. The current extra-handle convention avoids the historical stdin
+failure below. **Windows now passes the full ooth lifecycle through a private
+FFI hook; Linux's released binary lacks FFI and remains limited to async accept.**
+No runtime is recompiled, as explicitly requested. Independent control listeners
+are diagnostics, not replacements for socket activation.
+
+`worker.php` is the new protocol worker. The [common matrix](../runtime/README.md)
+checks HTTP/1.1 and h2c directly and through Caddy/Nginx, cold activation, growth,
+both serving PIDs, balanced events, idle zero, reactivation and graceful draining.
+HTTP/1.1 cases also exercise the native WebSocket server: text/binary echo,
+ping/pong, survival beyond idle TTL and both close directions. The explicit
+`recv()` loop and native `stop()` retain active HTTP responses during shutdown.
+This remains a pinned private-ABI adapter, not a public adoption API.
 
 ## Reproduce
 
@@ -33,8 +44,8 @@ CGO_ENABLED=0 OOTH_TEST_TRUEASYNC="$PWD/build/runtime-trueasync/linux/php-trueas
 ```
 
 `TestTrueAsyncCompatibility` is opt-in. Its Windows adoption case deliberately
-asserts the known failure, so a green compatibility audit does **not** mean a
-working activated Windows worker. If a runtime upgrade fixes that case, the
+asserts the known stdin failure, so a green compatibility audit alone does **not**
+mean a working stdin-based Windows worker. If a runtime upgrade fixes that case, the
 test must change to require successful adoption.
 
 ## Local results
@@ -48,13 +59,15 @@ Verified on Windows amd64 and Linux amd64/WSL2:
 | Imported stdin duplicate, coroutine `socket_accept` | Three connections served | Fails before PHP script runs |
 | Built-in server adopting ooth listener | No public adoption entry point found | Same missing API, plus stdin startup failure |
 | Extra handle, ordinary stdin, three worker processes | Async accept succeeds on fd 3 | Native HTTP/1.1 and h2c succeed via private FFI hook |
+| Extra handle, full ooth lifecycle and native WebSocket | Skipped: static release has no FFI | Pass directly and through Caddy/Nginx |
 
 `socket.php` is a low-level diagnostic using the runtime's socket extension and
 coroutines, **not** a replacement HTTP implementation. `server.php` exercises
 the real native HTTP server on its own control listener, without activation.
 The test parent passes stdin using ooth's `OpenListener`; it never accepts or
 forwards the application traffic. Children are forcefully cleaned up by this
-bounded diagnostic; graceful draining has not yet been certified for TrueAsync.
+bounded diagnostic. The separate `worker.php` lifecycle suite verifies graceful
+draining on Windows; do not confuse its result with these older control probes.
 
 ## Extra handle and FFI workaround
 
@@ -64,8 +77,8 @@ three simultaneously running PHP processes. Every child reads an ordinary line
 from stdin, writes readiness on stdout and diagnostics on stderr, and must serve
 its own PID through the inherited listener. The parent never accepts or forwards
 traffic. ooth now defaults to this environment/extra-handle convention, with
-explicit `socket_handoff: stdin` for legacy workers. The TrueAsync fixture still
-does not implement ooth telemetry or the stdin stop protocol.
+explicit `socket_handoff: stdin` for legacy workers. This original three-worker
+fixture does not implement the protocol; the newer `worker.php` does.
 
 Existing Go APIs provide the inheritance, without another toolchain patch:
 
@@ -97,11 +110,16 @@ This **private ABI workaround has limits**:
 - The reactor takes ownership of the child's inherited socket. The supervisor
   retains its separate handle. The function-pointer callback must remain alive
   during the call, and the saved pointer must be a value copy, not a reference.
-- Linux's official binary does not include FFI. Its extra-handle test uses
+- Linux's official binary is static and does not include FFI (`--with-ffi` is
+  absent from its build configuration); the 0.10.0 release supplies no alternative
+  Linux FFI build. The user chose to record this limit without compiling a runtime.
+  Its extra-handle test uses
   `socket.php` and async `socket_accept`, not the built-in HTTP server. No alternative
   extension or interpreter build has been installed.
-- Request telemetry, graceful draining, autoscaling and proxy-stack integration
-  are not covered by this workaround. Cleanup is forceful and bounded by the test.
+- The original extra-handle diagnostic uses forceful bounded cleanup. The new
+  Windows lifecycle matrix covers telemetry, graceful draining, autoscaling,
+  Caddy/Nginx and WebSockets using the same hook. Linux native-server adoption
+  remains untested, and neither suite establishes private ABI stability.
 
 The result establishes that a released Windows binary can adopt the listener
 without recompilation and that an additional handle avoids the stdin startup
@@ -140,17 +158,18 @@ Internally, `http_server_class.c` already calls `ZEND_ASYNC_SOCKET_LISTEN_FD` fo
 duplicates shared between its own worker threads.
 
 The minimal integration should expose that existing primitive, for example a
-new **proposed, not currently available** `HttpServerConfig::addStdinListener()`:
+new **proposed, not currently available** `HttpServerConfig::addInheritedListener(handle)`:
 
-1. Resolve stdin to an fd on Linux or `GetStdHandle(STD_INPUT_HANDLE)` on Windows,
-   verify a listening socket, and duplicate it with explicit ownership.
+1. Accept a native listener from `OOTH_LISTEN_HANDLE` (fd on Linux, SOCKET on
+   Windows), verify it and duplicate it with explicit ownership. Legacy stdin
+   retrieval can remain a separate option.
 2. Feed the duplicate into `ZEND_ASYNC_SOCKET_LISTEN_FD` without any bind/rebind,
    preserving the native HTTP/1 and HTTP/2 protocol selection and stop path.
 3. Keep an inherited listener out of ordinary Windows stdin stream I/O setup,
    avoiding both the CRT/native handle mismatch and competing libuv adoption.
-4. Test multiple ooth worker processes sharing that listener, h2c reuse and
-   concurrency, request telemetry, signal-driven draining, idle zero and
-   reactivation. Ordinary native-server control tests do not replace these.
+4. Run the existing lifecycle matrix against the public method, including h2c
+   reuse, telemetry, stdin-driven draining, idle zero, reactivation and WebSockets.
+   Ordinary native-server control tests do not replace these.
 
 This belongs in TrueAsync/PHP, not another ooth or Go toolchain patch. No public
 issue/PR was sent and no patched TrueAsync binary is claimed here.

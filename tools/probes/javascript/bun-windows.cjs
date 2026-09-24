@@ -61,7 +61,8 @@ if (!isMainThread) {
         if (Atomics.load(state, 0)) { symbols.closesocket(BigInt(fd)); return; }
         const connection = new net.Socket();
         connections.add(connection);
-        connection.on('error', error => owner.emit('error', error));
+        // A peer reset ends this connection, not the listening worker.
+        connection.on('error', error => { if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') owner.emit('error', error); });
         connection.once('close', () => { connections.delete(connection); finish(); });
         server.emit('connection', connection);
         connection.connect({ fd, fdIsRawSocket: true });
