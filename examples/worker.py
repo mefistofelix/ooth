@@ -4,6 +4,7 @@ import signal
 import socket
 import sys
 import time
+import threading
 
 stopping = False
 
@@ -29,6 +30,18 @@ if os.name == "nt":
 else:
     signal.signal(signal.SIGTERM, stop)
     descriptor = 0
+
+if "OOTH_LISTEN_HANDLE" in os.environ:
+    descriptor = int(os.environ["OOTH_LISTEN_HANDLE"])
+
+    def control():
+        for line in sys.stdin:
+            fields = dict(field.split("=", 1) for field in line.split())
+            if fields.get("v") == "1" and fields.get("event") == "stop":
+                stop(None, None)
+                return
+
+    threading.Thread(target=control, daemon=True).start()
 
 listener = socket.socket(fileno=descriptor)
 listener.settimeout(0.2)

@@ -29,14 +29,16 @@ func TestPressureWorker(t *testing.T) {
 	if mode == "" {
 		return
 	}
-	listener, err := net.FileListener(os.Stdin)
+	listener, err := testWorkerListener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	os.Stdin.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, StopSignal)
 	defer stop()
+	if os.Getenv("OOTH_LISTEN_HANDLE") != "" {
+		testWorkerControl(stop)
+	}
 	go func() { <-ctx.Done(); listener.Close() }()
 	var output sync.Mutex
 	emit := func(kind, id string, duration int64) {
@@ -315,6 +317,7 @@ func runPressure(t *testing.T, root string, scenario pressureCase) {
 				app.Env["TEST_PRESSURE_BLOCK"] = "1"
 			}
 		case "PHP_CGI":
+			app.SocketHandoff = "stdin"
 			app.Command = []string{runtime, "-n", "-d", "cgi.force_redirect=0"}
 			if launcher := os.Getenv("OOTH_TEST_PHP_LAUNCHER"); launcher != "" {
 				launcher, _ = filepath.Abs(launcher)

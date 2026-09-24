@@ -18,6 +18,14 @@ import (
 	"unsafe"
 )
 
+func inheritListener(cmd *exec.Cmd, file *os.File, fd int) (uintptr, error) {
+	for len(cmd.ExtraFiles) < fd-3 {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, nil)
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+	return uintptr(2 + len(cmd.ExtraFiles)), nil
+}
+
 // Read every visible ancestor: a sibling may exhaust a parent's budget even
 // while this supervisor's own subtree is mostly idle.
 func (owner *processOwner) resourceGroups() (map[string]resourceGroup, error) {

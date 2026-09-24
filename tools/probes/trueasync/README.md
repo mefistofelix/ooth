@@ -63,7 +63,9 @@ separately. `TestTrueAsyncExtraHandle` proves this with ooth's `OpenListener` an
 three simultaneously running PHP processes. Every child reads an ordinary line
 from stdin, writes readiness on stdout and diagnostics on stderr, and must serve
 its own PID through the inherited listener. The parent never accepts or forwards
-traffic. This experiment does not change the production stdin convention.
+traffic. ooth now defaults to this environment/extra-handle convention, with
+explicit `socket_handoff: stdin` for legacy workers. The TrueAsync fixture still
+does not implement ooth telemetry or the stdin stop protocol.
 
 Existing Go APIs provide the inheritance, without another toolchain patch:
 

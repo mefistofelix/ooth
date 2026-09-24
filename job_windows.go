@@ -13,6 +13,18 @@ import (
 	"unsafe"
 )
 
+func inheritListener(cmd *exec.Cmd, file *os.File, _ int) (uintptr, error) {
+	handle := syscall.Handle(file.Fd())
+	if err := syscall.SetHandleInformation(handle, syscall.HANDLE_FLAG_INHERIT, syscall.HANDLE_FLAG_INHERIT); err != nil {
+		return 0, err
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.AdditionalInheritedHandles = append(cmd.SysProcAttr.AdditionalInheritedHandles, handle)
+	return uintptr(handle), nil
+}
+
 var jobKernel = syscall.NewLazyDLL("kernel32.dll")
 var createJobObject = jobKernel.NewProc("CreateJobObjectW")
 var setJobInformation = jobKernel.NewProc("SetInformationJobObject")

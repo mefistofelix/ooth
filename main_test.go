@@ -80,6 +80,8 @@ func TestWorkerHelper(t *testing.T) {
 	defer cancel()
 	if os.Getenv("TEST_OOTH_IGNORE_STOP") == "1" {
 		ctx = context.Background()
+	} else if os.Getenv("OOTH_LISTEN_HANDLE") != "" || os.Getenv("TEST_OOTH_VIRTUAL") == "1" {
+		testWorkerControl(cancel)
 	}
 	emit := func(event Event) {
 		if os.Getenv("TEST_OOTH_STDOUT") == "silent" {
@@ -98,12 +100,11 @@ func TestWorkerHelper(t *testing.T) {
 		<-ctx.Done()
 		os.Exit(0)
 	}
-	listener, err := net.FileListener(os.Stdin)
+	listener, err := testWorkerListener()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	os.Stdin.Close()
 	go func() { <-ctx.Done(); listener.Close() }()
 	switch os.Getenv("TEST_OOTH_STDOUT") {
 	case "plain":

@@ -2,15 +2,17 @@
 
 Minimal process supervisor with lazy socket activation, written in Go. The supervisor lives in **`main.go`**, with process ownership utilities in `job_linux.go` and `job_windows.go`, selected by Go at compilation. Linux and Windows builds use `CGO_ENABLED=0`; the executable does not need Go, a shell, or external management commands at runtime. Windows still uses the operating system's DLLs.
 
-ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool; each worker inherits the listener on standard input and accepts connections itself. **ooth never accepts, reads, copies, or proxies application traffic.** “Copyless” here means no forwarding through the supervisor, not that the operating system or application performs no copies.
+ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool; each worker inherits an additional listener handle, reads its number from `OOTH_LISTEN_HANDLE`, and accepts connections itself. Legacy stdin handoff is configurable. **ooth never accepts, reads, copies, or proxies application traffic.** “Copyless” here means no forwarding through the supervisor, not that the operating system or application performs no copies.
 
 This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. It does not mount filesystems, configure the machine, or implement a service manager for Windows SCM.
 
 ## Build and run
 
-The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. An additional inherited handle keeps stdin usable on both OSes. A Windows-only experimental FFI hook now connects three native HTTP/1.1/h2c servers to the same inherited listener without recompiling PHP. It uses a private ABI and creates an unused temporary listener; it is not a production worker adapter. The Linux release lacks FFI, so its additional-handle test covers async accept only. The production worker convention remains stdin.
+The [PHP TrueAsync compatibility audit](tools/probes/trueasync/README.md) verifies the native HTTP/1.1/h2c server on both platforms. An additional inherited handle keeps stdin usable on both OSes. A Windows-only experimental FFI hook connects three native HTTP/1.1/h2c servers to the same inherited listener without recompiling PHP. It uses a private ABI and creates an unused temporary listener; it is not a production worker adapter. The Linux release lacks FFI, so its additional-handle test covers async accept only.
 
 The [Socketify ctypes experiment](tools/probes/socketify/README.md) also passed on Linux and Windows: three Python workers use the real Socketify HTTP/1.1 server on an extra inherited listener, and remaining workers keep serving after one closes normally. It reinitializes an internal uSockets poll after closing a temporary listener, requires pinned native binaries, and needs no C/C++ compilation. It remains an experimental adapter without telemetry or certified request draining.
+
+The [Node/Bun/Deno experiments](tools/probes/javascript/README.md) passed shared-listener HTTP/1.1, ordinary stdin, command-based shutdown and active-response draining on both OSes. Node uses a private binding on Windows. Bun uses its fd-capable TCP server on Linux and an FFI accept thread on Windows, feeding its HTTP compatibility server. Deno Windows uses FFI Winsock accept and adopts the connected sockets into its HTTP compatibility server; direct listener adoption still fails. These runtime adapters are experimental.
 
 ```sh
 bash ./build.sh
@@ -52,6 +54,7 @@ env:
 listen:
   network: tcp
   address: 127.0.0.1:8080
+socket_handoff: env
 requires: [database, cache]
 min_workers: 0
 max_workers: 4
@@ -65,6 +68,16 @@ scale_window: 1s
 ```
 
 `command` is an argument list, executed directly without a shell. Workers must remain in the foreground. `name` defaults to the containing directory's name. Networks are `tcp`, `tcp4`, `tcp6`, and `unix`. On Windows, the worker's own language/runtime must also support Unix sockets; CPython's Windows build does not currently implement their accept path, so the Python example uses TCP there.
+
+`socket_handoff` selects how the listener reaches a worker:
+
+| Value | Behavior |
+| --- | --- |
+| `env` or omitted | Default on both OSes: extra inherited listener; `OOTH_LISTEN_HANDLE` contains its decimal fd/native handle. Linux currently assigns fd 3. stdin remains a pipe. |
+| `stdin` or `0` | Listener replaces stdin, for stock PHP-CGI and other compatible programs. No stdin stop command is possible. |
+| `3` through `1024` | Linux only: assign that exact fd, also publish its value in `OOTH_LISTEN_HANDLE`, and retain the stdin pipe. |
+
+Windows does not map additional native handles to arbitrary CRT fd numbers, so numeric choices other than `0` are rejected there. stdout (`1`) and stderr (`2`) are reserved for output and logs. The environment variable communicates an **already inherited socket**, not an address or a handle that can be opened independently. This changes the earlier stdin default; existing stdin-based workers must set `socket_handoff: stdin` explicitly.
 
 Defaults are shown above except `max_workers`, which defaults to 1. The six pool controls are `min_workers`, `max_workers`, `concurrency`, `scale_at`, `scale_window` and `idle_timeout`. `concurrency` is the sustainable simultaneous request count declared per worker; durations alone cannot reveal it. `scale_at` accepts a number or percentage, for example `80` or `80%`.
 
@@ -99,7 +112,7 @@ password: 'account-password'
 
 Linux sets the UID, primary GID and account's supplementary groups in the child. The primary group defaults to the account's group. An unprivileged caller retaining its own UID keeps its existing supplementary groups. Changing identity requires the corresponding OS permissions. With CGO disabled, account lookup uses `/etc/passwd` and `/etc/group`, not NSS plugins.
 
-Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and stdin inheritance. A different account requires `password`; an explicit empty string is passed as an empty password. The current account can be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
+Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and listener inheritance. A different account requires `password`; an explicit empty string is passed as an empty password. The current account can be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
 
 The password is read directly from YAML as requested; restrict that file's permissions. It is not placed in the worker's arguments or environment, and YAML diagnostics omit source excerpts. This switches process credentials, without loading a Windows profile or constructing a login environment; use `env` and `directory` for application settings. Linux rejects `password`; Windows rejects `group`. Linux different-user listener inheritance was tested locally; Windows current-user inheritance and authentication failures passed, while a successful different-account Windows spawn still needs validation with a suitable account. `OOTH_TEST_WINDOWS_USER` and `OOTH_TEST_WINDOWS_PASSWORD` enable that optional test only.
 
@@ -130,10 +143,10 @@ Virtual services have `max_workers: 1`. They remain running while needed, then s
 
 ## Worker convention
 
-1. Convert inherited stdin into a listening socket: fd 0 on Unix, `STD_INPUT_HANDLE` on Windows. Do not read request bytes from stdin as a stream.
+1. Read the inherited listener number from `OOTH_LISTEN_HANDLE`: a file descriptor on Linux or native SOCKET on Windows. Adopt it using the runtime's socket API. With explicit `socket_handoff: stdin`, recover fd 0 / `STD_INPUT_HANDLE` instead.
 2. To opt into request telemetry, make the first stdout line the `ready` handshake below. This detection is independent of the configured readiness gate. Send logs to stderr after opting in.
 3. Emit `start` and `end` for every request. Flush each complete line. Concurrent workers must serialize writes to their own event stream.
-4. On the graceful signal, stop accepting new requests, finish active requests, then exit.
+4. After the handshake, read the `v=1 event=stop ts=...` command from stdin, stop accepting new requests, finish active requests, then exit. Handle OS graceful notifications too, for legacy stdin handoff or shutdown before the handshake.
 
 ```text
 v=1 event=ready ts=1790193600000000000
@@ -143,26 +156,28 @@ v=1 event=end ts=1790193600002000000 id=42 duration_ns=1000000
 
 The first complete stdout line must be a valid version-1 `ready` event to enable telemetry. Otherwise stdout is forwarded to ooth's stderr as ordinary output for that worker's lifetime, including any later protocol-looking lines. A silent worker remains supervised without telemetry. Without the handshake there is no request-based growth, idle shrinking or request watchdog; configured minimum workers, cold activation, crash restart and shutdown still work. Virtual dependencies can still stop when no longer required. This default needs no worker changes; `ready: event` opts into the stricter readiness requirement described above.
 
-No JSON, escaping, or control channel. Fields are space-separated `key=value` pairs; values are printable ASCII without spaces or `=`. Request IDs are unique among active requests within one worker. `ts` is Unix time in nanoseconds; `duration_ns` is elapsed request time in nanoseconds, preferably measured with a monotonic clock. Supervisor deadlines use its own monotonic clock, so worker clock changes cannot extend them. After an accepted handshake, unknown/duplicate fields, oversized lines (4096-byte limit), invalid event order, and a broken event stream stop that worker and enter the restart policy. Ordinary output has no protocol line-length limit.
+No JSON or escaping. Fields are space-separated `key=value` pairs; values are printable ASCII without spaces or `=`. Request IDs are unique among active requests within one worker. `ts` is Unix time in nanoseconds; `duration_ns` is elapsed request time in nanoseconds, preferably measured with a monotonic clock. Supervisor deadlines use its own monotonic clock, so worker clock changes cannot extend them. After an accepted handshake, unknown/duplicate fields, oversized lines (4096-byte limit), invalid event order, and a broken event stream stop that worker and enter the restart policy. Ordinary output has no protocol line-length limit.
 
-The environment contains `OOTH_WORKER=1` and `OOTH_CONCURRENCY`. Configuration cannot override `OOTH_*`. No ooth library is needed in the worker. See [examples/worker.py](examples/worker.py). Existing FastCGI programs may inherit stdin in a compatible way but need the handshake and request events to support request-based scaling and idle detection, regardless of `ready` configuration.
+ooth sends exactly one stop line on the worker's stdin pipe **only after accepting its stdout handshake**. The handshake now opts into both telemetry and stdin stop handling when stdin is available; this also works for virtual services. ooth sends no simultaneous signal after a successful write. Without a handshake, with listener-on-stdin, or if the pipe write fails, it uses the platform's graceful signal/notification. In either path `stop_timeout` bounds draining and then forces termination. This control protocol lives in `main.go`, not the Go toolchain patch.
+
+The environment contains `OOTH_WORKER=1`, `OOTH_CONCURRENCY` and, for additional listener handles, `OOTH_LISTEN_HANDLE`. Configuration cannot override `OOTH_*`. No ooth library is needed in the worker. See [examples/worker.py](examples/worker.py). Stock PHP-CGI uses `socket_handoff: stdin` and emits no ooth handshake; activation and supervision work, but request-based scaling and idle detection do not. PHP-CGI's `-b` creates a listener rather than importing an environment-provided handle; `FPM_SOCKETS` belongs to PHP-FPM. See the [CGI audit](tools/probes/proxy/README.md#php-cgi-listener-selection).
 
 ## Platform details
 
 Both platforms use `syscall.EpollCreate1`, `EpollCtl` and `EpollWait`. One goroutine waits for **all listeners**; there is no goroutine or periodic readiness check per listener. ooth registers `EPOLLIN | EPOLLONESHOT`, then rearms delivered listeners through the supervisor's existing 25 ms tick. This bounds notifications while a connection waits for a starting worker. Unique registration IDs discard events from removed configurations. A private loopback UDP socket wakes the poller during shutdown; it is not a worker control channel.
 
-Linux uses the existing kernel epoll implementation. The old `Read(nil)` change is gone; the only syscall addition on Linux is `EpollClose(int)`, a portable close spelling shared with the Windows extension. Shutdown sends `SIGTERM`, then kills the worker's cgroup after `stop_timeout`, or uses `Process.Kill` (`SIGKILL`) when cgroups are unavailable.
+Linux uses the existing kernel epoll implementation. The old `Read(nil)` change is gone; the only syscall addition on Linux is `EpollClose(int)`, a portable close spelling shared with the Windows extension. When stdin control is unavailable, shutdown sends `SIGTERM`. Both shutdown paths then kill the worker's cgroup after `stop_timeout`, or use `Process.Kill` (`SIGKILL`) when cgroups are unavailable.
 
 Windows needs more than that Unix patch. A connected socket's zero-byte `WSARecv` already waits for data, but a listening socket does not provide that operation. [Issue 15735](https://github.com/golang/go/issues/15735) and the tests in [CL 22031](https://go-review.googlesource.com/c/go/+/22031) concern connections after `Accept`; the comment quoted in [issue 27315](https://github.com/golang/go/issues/27315) points to that proposal. Local tests on stock Go 1.24.3 and 1.27.1 reproduced this distinction.
 
 The Windows toolchain patch:
 
 - Adds the epoll socket API using asynchronous `IOCTL_AFD_POLL` requests and one IOCP per poller. A separate AFD device handle owns the IOCP association; monitored sockets are not attached to it. Requests remain pinned until their completion packets are drained, including cancellation and close. No Rust, C, CGO, libuv or wepoll binary dependency is needed.
-- Uses the standard `exec.Cmd.Stdin` inheritance path. The former `StartProcess` override was removed after TCP and Unix lifecycle tests passed without it. Listener initialization first tries normal IOCP. Only when this fails with `ERROR_INVALID_PARAMETER` on a listening socket does it enable Go's existing local-event I/O path, adding deadline/close tracking. This follows libuv's imported-socket fallback approach. The inherited `AcceptEx` fallback checks deadline/close every 20 ms; that worker-side wait is separate from the supervisor's event-driven AFD poller. Connected sockets retain Go's normal I/O implementation.
+- Uses standard Go inheritance (`ExtraFiles` on Linux, `AdditionalInheritedHandles` on Windows, or legacy `Cmd.Stdin`); no socket-inheritance override is needed. The former `StartProcess` override was removed after TCP and Unix lifecycle tests passed without it. Listener initialization first tries normal IOCP. Only when this fails with `ERROR_INVALID_PARAMETER` on a listening socket does it enable Go's existing local-event I/O path, adding deadline/close tracking. This follows libuv's imported-socket fallback approach. The inherited `AcceptEx` fallback checks deadline/close every 20 ms; that worker-side wait is separate from the supervisor's event-driven AFD poller. Connected sockets retain Go's normal I/O implementation.
 - Adds the portable `exec.Cmd.NewProcessGroup` option (a no-op on Linux) and supports `Process.Signal(os.Interrupt)`. Visible GUI windows receive `WM_CLOSE`; console groups receive `CTRL_BREAK_EVENT`. A supervisor started without a console allocates a hidden console for its console workers.
 - Adds `syscall.SysProcAttr.JobObjects` and passes those handles through `PROC_THREAD_ATTRIBUTE_JOB_LIST` during process creation, before child code can run. Requires Windows 10 / Server 2016 or newer. Job creation, queries and termination live in `job_windows.go`, outside the toolchain patch. No `taskkill`, PowerShell, or shell command is launched by ooth.
 
-Workers must handle the graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Windows SCM service control is not implemented. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
+Workers without stdin protocol support must handle the OS graceful notification. A GUI may reject `WM_CLOSE`; a fully detached headless process has no universal graceful Windows notification. Such a process reaches the forceful timeout. Windows SCM service control is not implemented. Graceful shutdown still asks the foreground worker to drain its work; forced shutdown terminates its whole Job, including descendants.
 
 ### Descendant ownership
 
@@ -180,7 +195,7 @@ Go workers that share a Windows listener must use this patched toolchain too, in
 
 Other languages need their native inherited-socket support. PHP's TCP FastCGI accept path retrieves the native handle with `_get_osfhandle` and calls `accept`; that retrieval does not detach an IOCP. libuv already handles failed IOCP association for imported sockets using local events. Local Node.js 24.19.0 probes made three workers accept using its private native-handle binding, but public `listen({fd: 0})` and `listen(process.stdin)` failed on Windows. Node documents that listening on a file descriptor is unsupported there. The private-binding probe is diagnostic, not a supported Node worker adapter. The later proxy suite also ran PHP-CGI: directly on Linux and through the explicit invalid-output-handle launcher on Windows. See the probe notes for sources and reproduction steps.
 
-A further [Node 26.10.0 probe](tools/probes/README.md#node-through-stdin-alone) recovers the socket directly from stdin using built-in `node:ffi` and either `GetStdHandle` or `_get_osfhandle(0)`. Three concurrent workers passed without an additional inherited handle, handle-number environment variable or patched parent. Node still needs its private TCPWrap binding to adopt the Windows socket. The experimental fixture `tools/probes/node_worker.cjs` implements ooth telemetry and graceful draining; set `OOTH_TEST_NODE` to the Node executable to enable its lifecycle test. On Linux the fixture uses the public fd API. No Node/npm dependency was added to ooth, and the Windows adapter is not a stable public API.
+A further [Node 26.10.0 probe](tools/probes/README.md#node-through-stdin-alone) recovers the socket directly from stdin using built-in `node:ffi` and either `GetStdHandle` or `_get_osfhandle(0)`. Three concurrent workers passed without an additional inherited handle, handle-number environment variable or patched parent. Node still needs its private TCPWrap binding to adopt the Windows socket. The experimental fixture `tools/probes/node_worker.cjs` implements ooth telemetry and graceful draining; set `OOTH_TEST_NODE` to the Node executable to enable its lifecycle test. The current fixture defaults to `OOTH_LISTEN_HANDLE` and handles the stdin stop command; FFI is needed only for legacy Windows stdin handoff. On Linux it uses the public fd API. No Node/npm dependency was added to ooth, and the Windows adapter is not a stable public API.
 
 ### Reusable epoll extension
 
@@ -203,4 +218,4 @@ The supervisor is in `main.go`; platform process utilities are in `job_linux.go`
 
 Integration tests cover cold activation, TCP/Unix listeners, multiple worker processes, idle return to zero, virtual prerequisites, added/reloaded/removed applications, rejected configuration, graceful draining and forced termination. Set `OOTH_TEST_PYTHON` to an interpreter's absolute path to test the Python example as well. The workflow enables that test. The Linux suite also passed `go test -race` locally. Additional [platform probes](tools/probes/README.md) verified actual Linux PID 1 orphan reaping, Windows GUI shutdown and operation without a console or inherited standard handles. These are bounded checks, not a claim of compatibility with every worker/runtime.
 
-Dependencies: `sgtdi/fswatcher v1.3.0`, `goccy/go-yaml v1.19.2`, and fswatcher's indirect `golang.org/x/sys`. [Canonical Pebble](https://github.com/canonical/pebble) is an architectural reference, not a dependency.
+Direct dependencies: `sgtdi/fswatcher v1.3.0`, `goccy/go-yaml v1.19.2`, and `gopsutil/v4 v4.26.8`; transitive Go modules are pinned in `go.mod`/`go.sum`. [Canonical Pebble](https://github.com/canonical/pebble) is an architectural reference, not a dependency.

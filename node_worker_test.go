@@ -18,7 +18,7 @@ import (
 func TestNodeWorker(t *testing.T) {
 	node := os.Getenv("OOTH_TEST_NODE")
 	if node == "" {
-		t.Skip("set OOTH_TEST_NODE to test the experimental Node worker; Windows needs Node 26.1+ with FFI")
+		t.Skip("set OOTH_TEST_NODE to test the experimental Node worker")
 	}
 	directory := t.TempDir()
 	worker, err := filepath.Abs("tools/probes/node_worker.cjs")
@@ -33,13 +33,20 @@ func TestNodeWorker(t *testing.T) {
 	writeApp(t, filepath.Join(directory, "app", "ooth.yaml"), app)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, path, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+	log := &proxyLog{apps: make(map[string]proxyWorkerState)}
+	go func() { done <- Run(ctx, path, slog.New(log)) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
 		case err := <-done:
 			if err != nil {
 				t.Error(err)
+			}
+			log.mu.Lock()
+			lines := strings.Join(log.lines, "\n")
+			log.mu.Unlock()
+			if strings.Contains(lines, "worker exceeded graceful timeout") {
+				t.Errorf("Node failed to exit after draining: %s", lines)
 			}
 		case <-time.After(5 * time.Second):
 			t.Error("Node supervisor shutdown timeout")

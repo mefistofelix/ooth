@@ -84,7 +84,7 @@ try {
 }
 ```
 
-Both public Node paths failed with `EISDIR`. The native mode passed with three worker PIDs. **Native mode is diagnostic only**: it adds a known inherited socket handle through `AdditionalInheritedHandles`, passes its number in `HANDOFF_HANDLE`, and calls the private `process.binding('tcp_wrap')` API. It establishes that libuv can adopt this shared socket without a patched Go parent; it does not establish that Node's public API implements the production stdin convention. No new dependency or worker protocol extension was added to ooth.
+Both public Node paths failed with `EISDIR`. The native mode passed with three worker PIDs. **Native mode is diagnostic only**: it adds a known inherited socket handle through `AdditionalInheritedHandles`, passes its number in `HANDOFF_HANDLE`, and calls the private `process.binding('tcp_wrap')` API. It establishes that libuv can adopt this shared socket without a patched Go parent; it does not establish a public Windows Node listener-adoption API. The supervisor now explicitly supports env handoff by default, while this original diagnostic remains unchanged. No new dependency or worker protocol extension was added to ooth.
 
 ### Node through stdin alone
 
@@ -98,14 +98,14 @@ $node = 'C:/path/to/node-v26.10.0-win-x64/node.exe'
 
 Leave `HANDOFF_RAW` unset. `stdhandle` calls `GetStdHandle(STD_INPUT_HANDLE)` from `kernel32.dll`; `osfhandle` calls `_get_osfhandle(0)` from `ucrtbase.dll`. Both then pass the native socket to Node's private TCPWrap binding, which calls libuv. These modes require **no additional inherited handle, handle-number environment variable, IPC channel, npm dependency or Node patch**. Additional handle inheritance itself is a standard Windows/Go facility; the private part is Node's socket adoption API. FFI remains experimental, and TCPWrap is private, so these are compatibility probes, not a stable Node adapter. Node 24.19.0 lacks the built-in FFI module.
 
-`node_worker.cjs` exercises the actual ooth protocol over stdout and serves HTTP through stdin's listener. It handles SIGTERM on Linux and SIGBREAK on Windows, closes its listener, and lets active responses finish. `TestNodeWorker` verifies cold activation, idle shutdown and replacement, and draining a request during supervisor shutdown. A marker written only by the graceful handler distinguishes a cooperative exit from a forced kill.
+`node_worker.cjs` now reads the inherited listener from `OOTH_LISTEN_HANDLE` and exercises the actual ooth stdout protocol and stdin stop command. It also handles SIGTERM on Linux and SIGBREAK on Windows, closes its listener, and lets active responses finish. Its legacy stdin fallback remains for diagnostics; the default Windows path no longer needs FFI. `TestNodeWorker` verifies cold activation, idle shutdown and replacement, and draining a request during supervisor shutdown. It checks the graceful handler's marker and explicitly rejects any forced-timeout termination in the supervisor log.
 
 ```powershell
 $env:OOTH_TEST_NODE = $node
 & ./build/windows-amd64/go/bin/go.exe test -run '^TestNodeWorker$' -v -timeout 30s .
 ```
 
-On Linux the same fixture uses public `server.listen({fd: 0})`, without FFI or TCPWrap:
+On Linux the same fixture uses public `server.listen({fd: Number(process.env.OOTH_LISTEN_HANDLE)})`, without FFI or TCPWrap:
 
 ```sh
 OOTH_TEST_NODE=/absolute/path/to/node ./build/linux-amd64/go/bin/go test -run '^TestNodeWorker$' -v -timeout 30s .
@@ -121,3 +121,5 @@ Source audit:
 - [Node `server.listen(handle)`](https://nodejs.org/api/net.html#serverlistenhandle-backlog-callback) explicitly excludes listening on a file descriptor on Windows. [TCPWrap::Open](https://github.com/nodejs/node/blob/v24.19.0/src/tcp_wrap.cc) calls `uv_tcp_open` with the supplied number as the native socket, which is not a CRT fd-to-handle conversion.
 
 This Windows-only check does not alter Linux listener inheritance. The normal Linux worker can still use stock `net.FileListener(os.Stdin)`.
+
+The [JavaScript runtime suite](javascript/README.md) adds Bun and Deno on both OSes, preserves their explicit adapters and limitations, and tests shared listener ownership plus stdin shutdown.

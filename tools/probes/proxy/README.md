@@ -18,7 +18,7 @@ Local Linux and Windows checks used Caddy 2.11.4, Nginx 1.30.5, Node 26.10.0, th
 
 Caddy documents its [h2c upstream transport](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport). Nginx requires a version supporting [`proxy_http_version 2`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version), added in 1.29.4. These tests use HTTP/1.1 from client to proxy and h2c from proxy to Node; TLS and public listeners are unnecessary.
 
-HTTP/2 streams on an existing connection stay with the worker that accepted it. Scaling processes cannot move those streams. The test Node fixture limits concurrent streams per session and sends GOAWAY after each response, so subsequent new connections can exercise new workers. The test explicitly distinguishes pool growth from distribution of requests already accepted before that growth. This is a lifecycle fixture, not a benchmark or a production connection-pooling recommendation. On Windows, Node still uses the documented experimental FFI/private-binding fixture described in the parent probe README.
+HTTP/2 streams on an existing connection stay with the worker that accepted it. Scaling processes cannot move those streams. The test Node fixture limits concurrent streams per session and sends GOAWAY after each response, so subsequent new connections can exercise new workers. The test explicitly distinguishes pool growth from distribution of requests already accepted before that growth. This is a lifecycle fixture, not a benchmark or a production connection-pooling recommendation. On Windows, Node still uses the documented experimental native-handle/private-binding fixture described in the parent probe README.
 
 ## Windows PHP compatibility
 
@@ -66,3 +66,22 @@ sudo --preserve-env=OOTH_TEST_PYTHON,OOTH_TEST_NODE,OOTH_TEST_CADDY,OOTH_TEST_NG
 ```
 
 The helper's private subtree is terminated and removed on exit. It never modifies an existing service's cgroup. Without delegation, the suite can still exercise the documented direct-child fallback, with its stderr warning.
+
+## PHP-CGI listener selection
+
+The worker template explicitly sets `socket_handoff: stdin` for stock PHP-CGI;
+Python/Node use the new default extra-handle/environment convention and stdin
+stop after their ready handshake. PHP has no handshake and receives the existing
+OS graceful notification, followed by forceful timeout if needed.
+
+Audited the standard [CGI entry point](https://github.com/php/php-src/blob/PHP-8.5/sapi/cgi/cgi_main.c)
+and [FastCGI implementation](https://github.com/php/php-src/blob/PHP-8.5/main/fastcgi.c),
+and checked the actual Windows binary's `-h` output. `-b` / `--bindpath` opens a
+new listener from an address/port; without it the inherited listener is fd 0.
+No environment selector for an arbitrary inherited listener was found in this
+CGI path. `FCGI_WEB_SERVER_ADDRS` filters clients; `_FCGI_MUTEX_` and
+`_FCGI_SHUTDOWN_EVENT_` are Windows synchronization/control handles.
+`FPM_SOCKETS` belongs to [PHP-FPM](https://github.com/php/php-src/blob/PHP-8.5/sapi/fpm/fpm/fpm_sockets.c),
+which is not the Windows CGI binary. The similarly named
+[`FCGI_LISTENSOCK_FILENO`](https://github.com/FastCGI-Archives/fcgi2/blob/master/include/fastcgi.h)
+is a C constant with value 0, not an environment variable.

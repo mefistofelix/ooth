@@ -8,6 +8,8 @@ env:
 listen:
   network: tcp
   address: {{.Address}}
+{{if not .Telemetry}}socket_handoff: stdin
+{{end}}
 ready: {{if .Telemetry}}event{{else}}started{{end}}
 min_workers: 0
 max_workers: 2

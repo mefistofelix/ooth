@@ -267,6 +267,7 @@ type App struct {
 	Directory      string            `yaml:"directory"`
 	Env            map[string]string `yaml:"env"`
 	Listen         Socket            `yaml:"listen"`
+	SocketHandoff  string            `yaml:"socket_handoff,omitempty"`
 	SocketMode     *Permissions      `yaml:"socket_mode"`
 	MinWorkers     int               `yaml:"min_workers"`
 	MaxWorkers     int               `yaml:"max_workers"`
@@ -461,6 +462,15 @@ func (app App) validate() error {
 	}
 	if (app.Listen.Network == "") != (app.Listen.Address == "") {
 		return fmt.Errorf("listen.address is required")
+	}
+	if app.SocketHandoff != "" && app.SocketHandoff != "env" && app.SocketHandoff != "stdin" && app.SocketHandoff != "0" {
+		fd, err := strconv.Atoi(app.SocketHandoff)
+		if err != nil || fd < 3 || fd > 1024 {
+			return fmt.Errorf("socket_handoff must be env, stdin/0, or a Linux fd from 3 to 1024; stdout/stderr are reserved")
+		}
+		if runtime.GOOS != "linux" {
+			return fmt.Errorf("numeric socket_handoff requires Linux; use env for a native Windows handle")
+		}
 	}
 	if app.Listen.Network == "" && app.MaxWorkers != 1 {
 		return fmt.Errorf("virtual services have max_workers=1")
@@ -768,6 +778,7 @@ func (poller *Poller) Close() error {
 
 type process struct {
 	cmd       *exec.Cmd
+	control   *os.File
 	job       *processJob
 	service   *service
 	ready     bool
@@ -815,13 +826,42 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 		return fmt.Errorf("worker identity: %w", err)
 	}
 	defer releaseIdentity()
-	cmd.Env = os.Environ()
+	for _, variable := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(variable), "OOTH_LISTEN_HANDLE=") {
+			cmd.Env = append(cmd.Env, variable)
+		}
+	}
 	for key, value := range app.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	cmd.Env = append(cmd.Env, "OOTH_WORKER=1", "OOTH_CONCURRENCY="+strconv.Itoa(app.Concurrency))
-	if childFile != nil {
+	var control *os.File
+	if childFile != nil && (app.SocketHandoff == "stdin" || app.SocketHandoff == "0") {
 		cmd.Stdin = childFile
+	} else {
+		if childFile != nil {
+			fd, _ := strconv.Atoi(app.SocketHandoff)
+			if fd == 0 {
+				fd = 3
+			}
+			handle, err := inheritListener(cmd, childFile, fd)
+			if err != nil {
+				return err
+			}
+			cmd.Env = append(cmd.Env, "OOTH_LISTEN_HANDLE="+strconv.FormatUint(uint64(handle), 10))
+		}
+		input, output, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		defer input.Close()
+		control = output
+		defer func() {
+			if control != nil { // Start failed: the process never took ownership.
+				control.Close()
+			}
+		}()
+		cmd.Stdin = input
 	}
 	cmd.Stderr = os.Stderr
 	cmd.NewProcessGroup = true
@@ -838,7 +878,8 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	}
 	writer.Close()
 	cmd = job.cmd
-	child := &process{cmd: cmd, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
+	child := &process{cmd: cmd, control: control, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
+	control = nil
 	if app.Ready == "started" {
 		child.ready = true
 		child.idleSince = now
@@ -877,6 +918,9 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	}()
 	go func() {
 		err := manager.owner.Wait(job)
+		if child.control != nil {
+			child.control.Close()
+		}
 		cleanupErr := job.Close()
 		// A descendant must not keep a dead worker's stdout pipe open forever.
 		select {
@@ -1244,6 +1288,15 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 	}
 	child.stopping = now
 	manager.log.Info("worker stopping", "app", child.service.name, "pid", child.cmd.Process.Pid, "reason", reason)
+	if child.telemetry && child.control != nil {
+		// One short write per process fits in the empty stdin pipe; no reader
+		// cooperation is needed to return. The existing deadline bounds draining.
+		if _, err := fmt.Fprintf(child.control, "v=1 event=stop ts=%d\n", now.UnixNano()); err == nil {
+			return
+		} else {
+			manager.log.Warn("stdin stop failed; sending signal", "pid", child.cmd.Process.Pid, "error", err)
+		}
+	}
 	if err := child.cmd.Process.Signal(StopSignal); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		manager.log.Error("graceful signal failed", "pid", child.cmd.Process.Pid, "error", err)
 	}
