@@ -2,6 +2,8 @@
 
 ## Engineering preferences
 
+- Keep .gitignore as a root allowlist: unknown root files/directories are ignored; explicitly include project metadata, src/, test/, examples/, golang_patch/ and .github/. Generated test executables remain ignored within those trees.
+
 - Preserve file line endings. The user explicitly requests global Git core.autocrlf=false and no repository .gitattributes normalization rules. Do not restore automatic EOL conversion.
 
 These principles apply across languages, runtimes, and frameworks.

@@ -1,5 +1,15 @@
-/bin/
-/build/
+# Ignore everything at the root unless explicitly included below.
+/*
+!/.gitignore
+!/AGENTS.md
+!/README.md
+!/build.sh
+!/.github/
+!/src/
+!/test/
+!/examples/
+!/golang_patch/
+
+# Generated test executables remain ignored inside included directories.
 *.test
 *.test.exe
-/tmp/
