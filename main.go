@@ -269,6 +269,7 @@ type App struct {
 	Directory      string            `yaml:"directory"`
 	Env            map[string]string `yaml:"env"`
 	Vars           map[string]string `yaml:"vars,omitempty"`
+	RestartOn      []RestartRule     `yaml:"restart_on,omitempty"`
 	Listen         Socket            `yaml:"listen"`
 	SocketHandoff  string            `yaml:"socket_handoff,omitempty"`
 	SocketMode     *Permissions      `yaml:"socket_mode"`
@@ -283,6 +284,38 @@ type App struct {
 	ScaleWindow    time.Duration     `yaml:"scale_window,omitempty"`
 	ScaleDelay     time.Duration     `yaml:"scale_delay,omitempty"` // Legacy spelling of scale_window.
 	Source         string            `yaml:"-"`
+}
+
+type RestartRule struct {
+	Glob   string   `yaml:"glob"`
+	Events []string `yaml:"events,omitempty"`
+}
+
+var fileEvents = map[string]fswatcher.EventType{
+	"create": fswatcher.EventCreate, "write": fswatcher.EventMod,
+	"remove": fswatcher.EventRemove, "rename": fswatcher.EventRename,
+	"chmod": fswatcher.EventChmod,
+}
+
+func (rule RestartRule) matches(event fswatcher.WatchEvent) bool {
+	path := filepath.Clean(event.Path)
+	matched, _ := filepath.Match(rule.Glob, path)
+	// A replaced directory can change every matching file below it without
+	// individual child events, including files created before a new watch is ready.
+	if slices.Contains(event.Types, fswatcher.EventCreate) || slices.Contains(event.Types, fswatcher.EventRemove) || slices.Contains(event.Types, fswatcher.EventRename) {
+		for parent := filepath.Dir(rule.Glob); !matched && filepath.Dir(parent) != parent; parent = filepath.Dir(parent) {
+			matched, _ = filepath.Match(parent, path)
+		}
+	}
+	if !matched {
+		return false
+	}
+	for _, name := range rule.Events {
+		if slices.Contains(event.Types, fileEvents[name]) {
+			return true
+		}
+	}
+	return false
 }
 
 type Snapshot struct {
@@ -316,31 +349,13 @@ func Load(path string) (Snapshot, error) {
 	sockets := make(map[Socket]string)
 	for _, pattern := range main.Watch {
 		pattern = resolve(filepath.Dir(path), pattern)
-		if strings.Contains(pattern, "**") {
-			return Snapshot{}, fmt.Errorf("glob %q: use * for one directory level; ** is not supported", pattern)
+		root, err := watchRoot(pattern)
+		if err != nil {
+			return Snapshot{}, err
 		}
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return Snapshot{}, fmt.Errorf("glob %q: %w", pattern, err)
-		}
-		root := pattern
-		if index := strings.IndexAny(root, "*?["); index >= 0 {
-			root = root[:index]
-		}
-		root = filepath.Dir(root)
-		for {
-			info, err := os.Stat(root)
-			if err == nil && info.IsDir() {
-				break
-			}
-			if err != nil && !os.IsNotExist(err) {
-				return Snapshot{}, err
-			}
-			parent := filepath.Dir(root)
-			if parent == root {
-				return Snapshot{}, fmt.Errorf("cannot watch %q", pattern)
-			}
-			root = parent
 		}
 		result.Roots = append(result.Roots, root)
 		for _, file := range matches {
@@ -386,6 +401,26 @@ func Load(path string) (Snapshot, error) {
 			}
 			if _, _, err := app.expandLaunch(app.Listen.Address); err != nil {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
+			}
+			for index := range app.RestartOn {
+				rule := &app.RestartOn[index]
+				if rule.Glob == "" {
+					return Snapshot{}, fmt.Errorf("%s: restart_on requires a glob", file)
+				}
+				rule.Glob = resolve(filepath.Dir(file), rule.Glob)
+				root, err := watchRoot(rule.Glob)
+				if err != nil {
+					return Snapshot{}, fmt.Errorf("%s: restart_on: %w", file, err)
+				}
+				if len(rule.Events) == 0 {
+					rule.Events = []string{"create", "write", "remove", "rename"}
+				}
+				for _, event := range rule.Events {
+					if _, ok := fileEvents[event]; !ok {
+						return Snapshot{}, fmt.Errorf("%s: restart_on event %q must be create, write, remove, rename or chmod", file, event)
+					}
+				}
+				result.Roots = append(result.Roots, root)
 			}
 			if app.Listen.Network != "" {
 				if previous, ok := sockets[app.Listen]; ok {
@@ -526,6 +561,36 @@ func resolve(directory, path string) string {
 	return filepath.Join(directory, path)
 }
 
+// Watch the nearest existing directory, so globs also cover future files and
+// atomic replacements instead of following just today's matching inodes.
+func watchRoot(pattern string) (string, error) {
+	if strings.Contains(pattern, "**") {
+		return "", fmt.Errorf("glob %q: use * for one directory level; ** is not supported", pattern)
+	}
+	if _, err := filepath.Match(pattern, ""); err != nil {
+		return "", fmt.Errorf("glob %q: %w", pattern, err)
+	}
+	root := pattern
+	if index := strings.IndexAny(root, "*?["); index >= 0 {
+		root = root[:index]
+	}
+	root = filepath.Dir(root)
+	for {
+		info, err := os.Stat(root)
+		if err == nil && info.IsDir() {
+			return root, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", fmt.Errorf("cannot watch %q", pattern)
+		}
+		root = parent
+	}
+}
+
 // Expand each argument/value independently: no shell, word splitting or recursive
 // environment expansion. Keep the stored configuration unchanged for reloads.
 func (app App) expandLaunch(address string) ([]string, map[string]string, error) {
@@ -596,9 +661,14 @@ func (app App) expandLaunch(address string) ([]string, map[string]string, error)
 	return command, childEnv, nil
 }
 
-// Watch rescans globs after filesystem events, including directory creation
-// and atomic file replacement. Periodic reconciliation covers dropped events.
-func Watch(ctx context.Context, path string, initial Snapshot, updates chan<- Snapshot) error {
+type watchUpdate struct {
+	snapshot *Snapshot
+	restarts map[string]App
+}
+
+// Watch reconciles configuration and batches per-app file restart requests.
+// Event loss retires watched workers conservatively; configuration still rescans.
+func Watch(ctx context.Context, path string, initial Snapshot, updates chan<- watchUpdate) error {
 	watcher, done, err := startWatcher(ctx, initial.Roots)
 	if err != nil {
 		return err
@@ -609,45 +679,75 @@ func Watch(ctx context.Context, path string, initial Snapshot, updates chan<- Sn
 	debounce := time.NewTimer(time.Hour)
 	debounce.Stop()
 	defer debounce.Stop()
+	restarts := make(map[string]App)
+	var lost int64
+	record := func(event fswatcher.WatchEvent) {
+		overflow := slices.Contains(event.Types, fswatcher.EventOverflow)
+		if overflow {
+			slog.Warn("file events lost; restarting active apps with restart_on rules")
+		}
+		for name, app := range initial.Apps {
+			for _, rule := range app.RestartOn {
+				if overflow || rule.matches(event) {
+					restarts[name] = app
+					break
+				}
+			}
+		}
+		debounce.Reset(100 * time.Millisecond)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case err := <-done:
 			return err
-		case _, ok := <-watcher.Events():
+		case event, ok := <-watcher.Events():
 			if !ok {
 				return <-done
 			}
-			debounce.Reset(100 * time.Millisecond)
+			record(event)
 			continue
-		case <-watcher.Dropped():
-			debounce.Reset(100 * time.Millisecond)
+		case event, ok := <-watcher.Dropped():
+			if !ok {
+				return <-done
+			}
+			record(event)
 			continue
 		case <-debounce.C:
 		case <-periodic.C:
 		}
+		if count := watcher.Stats().EventsLost; count > lost {
+			record(fswatcher.WatchEvent{Types: []fswatcher.EventType{fswatcher.EventOverflow}})
+			lost = count
+		}
+		update := watchUpdate{restarts: restarts}
 		next, err := Load(path)
 		if err != nil {
 			slog.Error("configuration rejected; keeping current services", "error", err)
-			continue
-		}
-		if reflect.DeepEqual(initial, next) {
-			continue
-		}
-		if !slices.Equal(initial.Roots, next.Roots) {
+		} else if !slices.Equal(initial.Roots, next.Roots) {
 			replacement, replacementDone, err := startWatcher(ctx, next.Roots)
 			if err != nil {
 				slog.Error("watch update rejected", "error", err)
-				continue
+			} else {
+				watcher.Close()
+				<-done
+				watcher, done = replacement, replacementDone
+				lost = 0
+				update.snapshot = &next
 			}
-			watcher.Close()
-			<-done
-			watcher, done = replacement, replacementDone
+		} else if !reflect.DeepEqual(initial, next) {
+			update.snapshot = &next
+		}
+		if update.snapshot == nil && len(restarts) == 0 {
+			continue
 		}
 		select {
-		case updates <- next:
-			initial = next
+		case updates <- update:
+			if update.snapshot != nil {
+				initial = next
+			}
+			restarts = make(map[string]App)
 		case <-ctx.Done():
 			return nil
 		}
@@ -1145,7 +1245,7 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 	}()
 	watchContext, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
-	updates := make(chan Snapshot)
+	updates := make(chan watchUpdate)
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- Watch(watchContext, path, initial, updates) }()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -1188,14 +1288,22 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 				stopping = true
 				manager.shutdown()
 			}
-		case next := <-updates:
+		case update := <-updates:
 			if !stopping {
-				if err := manager.apply(next); err != nil {
-					logger.Error("configuration rejected; keeping current services", "error", err)
-					pending = &next
-					retryConfig = time.Now().Add(time.Second)
-				} else {
-					pending = nil
+				if update.snapshot != nil {
+					if err := manager.apply(*update.snapshot); err != nil {
+						logger.Error("configuration rejected; keeping current services", "error", err)
+						pending = update.snapshot
+						retryConfig = time.Now().Add(time.Second)
+					} else {
+						pending = nil
+					}
+				}
+				for name, config := range update.restarts {
+					current := manager.services[name]
+					if current != nil && reflect.DeepEqual(current.config, config) {
+						manager.restart(current, time.Now())
+					}
 				}
 			}
 		case msg := <-manager.messages:
@@ -1210,6 +1318,21 @@ func Run(ctx context.Context, path string, logger *slog.Logger) error {
 			}
 			manager.tick(now, stopping)
 		}
+	}
+}
+
+func (manager *manager) restart(service *service, now time.Time) {
+	active := false
+	for child := range service.workers {
+		if child.stopping.IsZero() {
+			active = true
+			manager.stop(child, now, "watched files changed")
+		}
+	}
+	if active {
+		service.failures = 0
+		service.retryAt = time.Time{}
+		manager.log.Info("service restarting after file event", "app", service.name)
 	}
 }
 
@@ -1300,7 +1423,7 @@ func (manager *manager) apply(snapshot Snapshot) error {
 			listener = previous.listener
 		}
 		current := &service{name: name, config: app, listener: listener, workers: make(map[*process]struct{})}
-		// Retiring workers count against max_workers until they actually exit.
+		// Retain draining workers for cleanup, separately from active capacity.
 		if previous != nil {
 			for child := range previous.workers {
 				child.service = current
@@ -1368,6 +1491,11 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 		return
 	}
 	child.stopping = now
+	if child.failed {
+		// Replacements can start before this process exits; throttle failures now.
+		child.service.demand = true
+		child.service.backoff(now)
+	}
 	manager.log.Info("worker stopping", "app", child.service.name, "pid", child.cmd.Process.Pid, "reason", reason)
 	if child.telemetry && child.control != nil {
 		// One short write per process fits in the empty stdin pipe; no reader
@@ -1417,7 +1545,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		delete(manager.workers, child)
 		delete(service.workers, child)
 		manager.log.Info("worker exited", "app", service.name, "pid", child.cmd.Process.Pid, "error", msg.err)
-		if child.stopping.IsZero() || child.failed {
+		if child.stopping.IsZero() {
 			service.demand = true
 			service.backoff(now)
 		}
@@ -1516,8 +1644,6 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		if !child.ready && now.Sub(child.started) >= app.StartTimeout {
 			child.failed = true
 			manager.stop(child, now, "startup timeout")
-			child.service.backoff(now)
-			child.service.demand = true
 		}
 		if !child.ready && app.Ready != "event" && !child.probing && !now.Before(child.nextProbe) && child.stopping.IsZero() {
 			child.probing = true
@@ -1541,7 +1667,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 				}
 			}
 		}
-		if child.ready && now.Sub(child.started) >= 10*time.Second {
+		if child.ready && child.stopping.IsZero() && now.Sub(child.started) >= 10*time.Second {
 			child.service.failures = 0
 		}
 	}
@@ -1634,7 +1760,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			grow = true
 		}
 		grow = grow || (blocked == "" && pressureGrowth)
-		if grow && starting == 0 && len(service.workers) < app.MaxWorkers && !now.Before(service.retryAt) {
+		if grow && starting == 0 && available < app.MaxWorkers && !now.Before(service.retryAt) {
 			if err := manager.spawn(service, now); err != nil {
 				service.backoff(now)
 				manager.log.Error("worker start failed", "app", service.name, "error", err)

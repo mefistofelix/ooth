@@ -1,5 +1,8 @@
 name: web
 command: [python3, ../worker.py]
+restart_on:
+  - glob: ../worker.py
+    events: [create, write, remove, rename]
 listen:
   network: tcp
   address: 127.0.0.1:8080

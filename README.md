@@ -95,7 +95,7 @@ Linux also reads visible cgroup v2 ancestors of ooth and its worker delegation: 
 
 Listener notifications activate empty pools; they do not measure universal request pressure. Workers without the stdout handshake have no request-based scaling. Idle telemetry workers stop after `idle_timeout`, down to `min_workers`, including zero; required dependencies retain at least one. `request_timeout: 0s` disables the request watchdog.
 
-Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers count against `max_workers`, so an update can queue requests while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
+Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers no longer count toward active capacity or `max_workers`: replacements may start while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
 
 ### Arguments and environment placeholders
 
@@ -121,6 +121,76 @@ Only `command` and `env` values are expanded; `vars`, `directory`, `ready` and
 spawn uses the bound listener's actual address. Quote expressions in YAML.
 For example, an argument `"--endpoint={{.vars.endpoint}}"` and environment value
 `ENDPOINT: "{{.vars.endpoint}}"` receive the same string.
+
+### Restart an app when files change
+
+Each application can select filesystem changes that retire its current processes:
+
+```yaml
+restart_on:
+  - glob: config/*.yaml
+    events: [create, write, remove, rename]
+  - glob: src/*/*.js
+  - glob: public/*.php
+```
+
+This works for init services, inherited-socket workers and ordinary process pools.
+Paths are relative to the **application YAML**, regardless of `directory`;
+absolute paths are also accepted. Matching uses `filepath.Match`: `*` covers one
+path component, with `?` and character classes also supported; `**` is rejected.
+Rules apply to future files too. Omitted or empty `events` defaults to the four
+shown above. `chmod` is also accepted: Linux reports it separately, while the
+Windows backend reports attribute changes as `write`. Rename may also carry
+create/remove flags on Linux. Keeping the default set covers atomic file saves.
+A matching parent-directory create/remove/rename also invalidates its potential
+matching children. Keep watch roots stable; for replaceable subdirectories use
+a glob rooted at their persistent parent. No content comparison is performed.
+
+ooth reuses its filesystem watcher and merges matching events per app after a
+100 ms quiet period, following the watcher's own 100 ms event aggregation.
+The five-second configuration reconciliation bounds the wait during continuous
+events. A normal event affects only the matching apps. Reported queue overflow
+or event loss logs a warning and conservatively retires active apps that have
+restart rules; an exact lost event's type cannot be recovered. Invalid YAML
+edits retain the last valid rules. Rules can be added, changed or removed on reload.
+
+For a triggered app, **all current workers receive graceful stop**. They must
+stop accepting new work immediately, finish active requests, emit final events
+and exit. `stop_timeout` still forces termination when a process does not comply.
+ooth keeps its listening socket open, so connections can queue during draining;
+it never accepts those connections itself. Retiring processes are excluded from
+active capacity and `max_workers`. New demand can start a replacement immediately,
+even at `max_workers: 1`, while the old process completes its requests. Thus the
+total OS process count can temporarily exceed the maximum of active workers;
+each retiring process retains its original stop deadline.
+Without `listen`, socket availability during restart is the worker's responsibility.
+
+Replacement follows the existing minimum, startup, dependency and demand rules.
+An app with minimum zero and no fresh demand stays at zero after draining;
+editing a file never wakes an already dormant app. The previous autoscaled
+worker count is not restored automatically. Init services kept alive by
+`min_workers`, `startup` or a dependency start replacements during retirement too.
+Programs owning exclusive resources must release them as part of graceful stop;
+otherwise their replacement may need the normal startup retry/backoff.
+
+For example, with `min_workers: 0` and `max_workers: 1`, worker A is answering
+a slow request when its source changes. ooth asks A to stop; A closes its own
+listener reference and finishes that request. A new connection then activates
+worker B on the same parent listener. B loads the updated code and can answer
+before A exits. There are temporarily two processes, but only B counts as active.
+Without that new connection, no B starts. With `min_workers: 1`, B starts without
+waiting for traffic. Failure-triggered replacements retain the restart backoff,
+including while the failed process is still stopping.
+
+The runnable [Python example](examples/app1/ooth.yaml) watches `../worker.py`.
+Run it as shown above, send a slow request such as `/2000`, save `worker.py`,
+then send a second request. The response's worker PID identifies the replacement;
+the first request should finish on its original PID, within `stop_timeout`.
+
+Workers load the new source/configuration when the new process starts. Native
+Linux/Windows tests in `restart_test.go` cover active draining, fresh cached
+contents, retained TCP/Unix listeners, lazy zero, event filtering, atomic saves,
+rule replacement, rejected YAML and forced-timeout recovery.
 
 ## Process identity
 
@@ -300,7 +370,10 @@ v=1 event=stop ts=1790193601000000000
 
 ooth sends exactly one stop line on the worker's stdin pipe **only after accepting its stdout handshake**. The handshake now opts into both telemetry and stdin stop handling when stdin is available; this also works for virtual services. ooth sends no simultaneous signal after a successful write. Without a handshake, with listener-on-stdin, or if the pipe write fails, it uses the platform's graceful signal/notification. In either path `stop_timeout` bounds draining and then forces termination. This control protocol lives in `main.go`, not the Go toolchain patch.
 
-On stop, close the worker's listener, refuse new work, finish its active requests,
+On stop, close the worker's own listener reference immediately, stop the accept
+loop and refuse new requests on persistent connections too. Do not call socket
+`shutdown` on the shared listening socket: other workers and ooth still own it.
+Finish active requests,
 emit their final `end` lines, flush stdout and exit. The WebSocket examples send
 1001 Going Away and complete the close exchange. No `stopped` event exists: the
 OS process-exit notification is authoritative. Keeping a pipe or wait thread

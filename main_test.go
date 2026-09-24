@@ -80,7 +80,7 @@ func TestWorkerHelper(t *testing.T) {
 	defer cancel()
 	if os.Getenv("TEST_OOTH_IGNORE_STOP") == "1" {
 		ctx = context.Background()
-	} else if os.Getenv("OOTH_LISTEN_HANDLE") != "" || os.Getenv("TEST_OOTH_VIRTUAL") == "1" {
+	} else if os.Getenv("OOTH_LISTEN_HANDLE") != "" || os.Getenv("TEST_OOTH_VIRTUAL") == "1" || os.Getenv("TEST_OOTH_BIND") != "" {
 		testWorkerControl(cancel)
 	}
 	emit := func(event Event) {
@@ -100,12 +100,31 @@ func TestWorkerHelper(t *testing.T) {
 		<-ctx.Done()
 		os.Exit(0)
 	}
-	listener, err := testWorkerListener()
+	var listener net.Listener
+	var err error
+	if address := os.Getenv("TEST_OOTH_BIND"); address != "" {
+		listener, err = net.Listen("tcp", address)
+	} else {
+		listener, err = testWorkerListener()
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	go func() { <-ctx.Done(); listener.Close() }()
+	var cached []byte
+	if source := os.Getenv("TEST_OOTH_SOURCE"); source != "" {
+		cached, err = os.ReadFile(source)
+		if err != nil {
+			os.Exit(2)
+		}
+	}
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+		if directory := os.Getenv("TEST_OOTH_CLOSED"); directory != "" {
+			os.WriteFile(filepath.Join(directory, strconv.Itoa(os.Getpid())), []byte("closed"), 0600)
+		}
+	}()
 	switch os.Getenv("TEST_OOTH_STDOUT") {
 	case "plain":
 		fmt.Fprintln(os.Stdout, "ordinary startup log")
@@ -136,7 +155,7 @@ func TestWorkerHelper(t *testing.T) {
 		id := fields[1]
 		emit(Event{Type: "start", ID: id})
 		time.Sleep(delay)
-		fmt.Fprintf(connection, "%d %s\n", os.Getpid(), id)
+		fmt.Fprintf(connection, "%d %s%s\n", os.Getpid(), id, cached)
 		connection.Close()
 		emit(Event{Type: "end", ID: id, DurationNS: delay.Nanoseconds()})
 		if ctx.Err() != nil {

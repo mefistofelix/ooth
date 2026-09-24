@@ -7,11 +7,14 @@ import time
 import threading
 
 stopping = False
+listener = None
 
 
 def stop(signum, frame):
     global stopping
     stopping = True
+    if listener is not None:
+        listener.close()
 
 
 def event(kind, **fields):
@@ -52,6 +55,10 @@ while not stopping:
         connection, address = listener.accept()
     except (TimeoutError, BlockingIOError):
         continue
+    except OSError:
+        if stopping:
+            break
+        raise
     sequence += 1
     started = time.monotonic_ns()
     event("start", id=sequence)
