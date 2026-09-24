@@ -672,7 +672,7 @@ A further [Node 26.10.0 probe](test/integration/README.md#node-through-stdin-alo
 
 ### Reusable epoll extension
 
-The implementation is in [`golang_patch/patches/epoll_windows.txt`](golang_patch/patches/epoll_windows.txt), installed as `syscall/ooth_epoll_windows.go`. Its API has no knowledge of workers, configuration or ooth. The AFD mechanism follows the approach demonstrated by [wepoll](https://github.com/piscisaureus/wepoll) and [libuv](https://github.com/libuv/libuv/blob/v1.x/src/win/poll.c); attribution is included in `THIRD_PARTY_NOTICES.md`.
+The implementation is in [`golang_patch/patches/epoll_windows.txt`](golang_patch/patches/epoll_windows.txt), installed as `syscall/ooth_epoll_windows.go`. Its API has no knowledge of workers, configuration or ooth. The AFD mechanism follows the approach demonstrated by [wepoll](https://github.com/piscisaureus/wepoll) and [libuv](https://github.com/libuv/libuv/blob/v1.x/src/win/poll.c); attribution is included in [third-party notices](src/THIRD_PARTY_NOTICES.md).
 
 - Supports `EpollCreate`, `EpollCreate1`, `EpollCtl`, `EpollWait` and `EpollClose` on Windows amd64/arm64, for native Winsock sockets including TCP, UDP and Unix sockets.
 - Supports ADD/MOD/DEL, level triggering and `EPOLLONESHOT`; events include IN, OUT, PRI, ERR, HUP and RDHUP. Unsupported flags, including `EPOLLET`, are rejected. This is a documented subset, not complete Linux epoll compatibility.
