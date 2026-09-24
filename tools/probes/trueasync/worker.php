@@ -13,27 +13,36 @@ function event(string $type, array $fields = []): void {
     fflush(STDOUT);
 }
 
-$socket = (int) getenv('OOTH_LISTEN_HANDLE');
-if ($socket <= 0) {
-    throw new RuntimeException('Missing inherited listener');
-}
-$api = FFI::cdef('
+$bind = getenv('TEST_BIND_URL');
+$api = null;
+$config = (new HttpServerConfig())->setWorkers(1)->setShutdownTimeout(2);
+if ($bind !== false) {
+    $address = parse_url($bind);
+    $config->addListener($address['host'], $address['port']);
+} else {
+    $socket = (int) getenv('OOTH_LISTEN_HANDLE');
+    if ($socket <= 0) {
+        throw new RuntimeException('Missing inherited listener');
+    }
+    $api = FFI::cdef('
     typedef struct zend_async_listen_event_s zend_async_listen_event_t;
     typedef zend_async_listen_event_t *(*listen_fd_fn)(uintptr_t, int, uint32_t, size_t);
     extern listen_fd_fn zend_async_socket_listen_fd_fn;
 ', PHP_OS_FAMILY === 'Windows' ? dirname(PHP_BINARY) . '/php8ts.dll' : null);
-$close = PHP_OS_FAMILY === 'Windows'
+    $close = PHP_OS_FAMILY === 'Windows'
     ? FFI::cdef('int closesocket(uintptr_t socket);', 'ws2_32.dll')
     : FFI::cdef('int close(int fd);');
-$original = $api->new('listen_fd_fn[1]');
-$original[0] = $api->zend_async_socket_listen_fd_fn;
-$adopt = function ($temporary, $backlog, $flags, $extra) use ($api, $original, $socket, $close) {
-    $api->zend_async_socket_listen_fd_fn = $original[0];
-    if (PHP_OS_FAMILY === 'Windows') $close->closesocket($temporary);
-    else $close->close($temporary);
-    return ($original[0])($socket, $backlog, $flags, $extra);
-};
-$server = new HttpServer((new HttpServerConfig())->addListener('127.0.0.1', 0)->setWorkers(1)->setShutdownTimeout(2));
+    $original = $api->new('listen_fd_fn[1]');
+    $original[0] = $api->zend_async_socket_listen_fd_fn;
+    $adopt = function ($temporary, $backlog, $flags, $extra) use ($api, $original, $socket, $close) {
+        $api->zend_async_socket_listen_fd_fn = $original[0];
+        if (PHP_OS_FAMILY === 'Windows') $close->closesocket($temporary);
+        else $close->close($temporary);
+        return ($original[0])($socket, $backlog, $flags, $extra);
+    };
+    $config->addListener('127.0.0.1', 0);
+}
+$server = new HttpServer($config);
 $sequence = 0;
 $websockets = [];
 $server->addWebSocketHandler(function ($ws, $request) use (&$sequence, &$websockets) {
@@ -76,10 +85,10 @@ $control = Async\spawn(function () use ($server, &$websockets) {
         }
     }
 });
-$api->zend_async_socket_listen_fd_fn = $adopt;
+if ($api !== null) $api->zend_async_socket_listen_fd_fn = $adopt;
 try {
     $server->start();
     Async\await($control);
 } finally {
-    $api->zend_async_socket_listen_fd_fn = $original[0];
+    if ($api !== null) $api->zend_async_socket_listen_fd_fn = $original[0];
 }

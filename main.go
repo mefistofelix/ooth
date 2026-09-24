@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -266,6 +268,7 @@ type App struct {
 	Command        []string          `yaml:"command"`
 	Directory      string            `yaml:"directory"`
 	Env            map[string]string `yaml:"env"`
+	Vars           map[string]string `yaml:"vars,omitempty"`
 	Listen         Socket            `yaml:"listen"`
 	SocketHandoff  string            `yaml:"socket_handoff,omitempty"`
 	SocketMode     *Permissions      `yaml:"socket_mode"`
@@ -375,11 +378,14 @@ func Load(path string) (Snapshot, error) {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
 			}
 			app.Directory = resolve(filepath.Dir(file), app.Directory)
-			if strings.ContainsAny(app.Command[0], `/\`) {
+			if !strings.Contains(app.Command[0], "{{") && strings.ContainsAny(app.Command[0], `/\`) {
 				app.Command[0] = resolve(app.Directory, app.Command[0])
 			}
 			if app.Listen.Network == "unix" {
 				app.Listen.Address = resolve(filepath.Dir(file), app.Listen.Address)
+			}
+			if _, _, err := app.expandLaunch(app.Listen.Address); err != nil {
+				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
 			}
 			if app.Listen.Network != "" {
 				if previous, ok := sockets[app.Listen]; ok {
@@ -472,9 +478,6 @@ func (app App) validate() error {
 			return fmt.Errorf("numeric socket_handoff requires Linux; use env for a native Windows handle")
 		}
 	}
-	if app.Listen.Network == "" && app.MaxWorkers != 1 {
-		return fmt.Errorf("virtual services have max_workers=1")
-	}
 	if app.Ready != "event" && app.Ready != "started" {
 		network, address, ok := strings.Cut(app.Ready, "://")
 		if !ok || address == "" || (network != "tcp" && network != "unix") {
@@ -521,6 +524,76 @@ func resolve(directory, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Join(directory, path)
+}
+
+// Expand each argument/value independently: no shell, word splitting or recursive
+// environment expansion. Keep the stored configuration unchanged for reloads.
+func (app App) expandLaunch(address string) ([]string, map[string]string, error) {
+	environment := make(map[string]string)
+	for _, entry := range os.Environ() {
+		key, value, _ := strings.Cut(entry, "=")
+		environment[key] = value
+	}
+	values := map[string]any{"name": app.Name, "directory": app.Directory, "source": app.Source, "env": environment, "vars": app.Vars}
+	if app.Listen.Network != "" {
+		endpoint := map[string]string{"network": app.Listen.Network, "address": address}
+		uri := url.URL{Scheme: "tcp", Host: address}
+		if app.Listen.Network == "unix" {
+			endpoint["path"] = address
+			uri = url.URL{Scheme: "unix", Path: filepath.ToSlash(address)}
+			if !strings.HasPrefix(uri.Path, "/") {
+				uri.Path = "/" + uri.Path
+			}
+		} else {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, nil, fmt.Errorf("listen.address: %w", err)
+			}
+			endpoint["host"], endpoint["port"] = host, port
+		}
+		endpoint["url"] = uri.String()
+		values["listen"] = endpoint
+	}
+	expand := func(field, value string) (string, error) {
+		if !strings.Contains(value, "{{") {
+			return value, nil
+		}
+		compiled, err := template.New(field).Option("missingkey=error").Parse(value)
+		if err != nil {
+			return "", fmt.Errorf("invalid template in %s", field)
+		}
+		var result strings.Builder
+		if err := compiled.Execute(&result, values); err != nil {
+			return "", fmt.Errorf("cannot expand template in %s: check placeholder names and environment", field)
+		}
+		if strings.ContainsRune(result.String(), 0) {
+			return "", fmt.Errorf("NUL in expanded %s", field)
+		}
+		return result.String(), nil
+	}
+	command := make([]string, len(app.Command))
+	for index, argument := range app.Command {
+		value, err := expand(fmt.Sprintf("command[%d]", index), argument)
+		if err != nil {
+			return nil, nil, err
+		}
+		command[index] = value
+	}
+	if len(command) == 0 || command[0] == "" {
+		return nil, nil, fmt.Errorf("expanded command must name an executable")
+	}
+	if strings.ContainsAny(command[0], `/\`) {
+		command[0] = resolve(app.Directory, command[0])
+	}
+	childEnv := make(map[string]string, len(app.Env))
+	for key, value := range app.Env {
+		expanded, err := expand("env."+key, value)
+		if err != nil {
+			return nil, nil, err
+		}
+		childEnv[key] = expanded
+	}
+	return command, childEnv, nil
 }
 
 // Watch rescans globs after filesystem events, including directory creation
@@ -819,7 +892,15 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 		defer childFile.Close()
 	}
 	app := service.config
-	cmd := exec.Command(app.Command[0], app.Command[1:]...)
+	address := app.Listen.Address
+	if service.listener != nil {
+		address = service.listener.Addr().String()
+	}
+	command, environment, err := app.expandLaunch(address)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = app.Directory
 	releaseIdentity, err := app.Identity.apply(cmd)
 	if err != nil {
@@ -831,7 +912,7 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 			cmd.Env = append(cmd.Env, variable)
 		}
 	}
-	for key, value := range app.Env {
+	for key, value := range environment {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
 	cmd.Env = append(cmd.Env, "OOTH_WORKER=1", "OOTH_CONCURRENCY="+strconv.Itoa(app.Concurrency))
@@ -1577,7 +1658,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 				break
 			}
 			idle := child.telemetry && len(child.active) == 0 && now.Sub(child.idleSince) >= app.IdleTimeout
-			if service.listener == nil {
+			if app.Listen.Network == "" && !child.telemetry {
 				idle = !wanted[service.name] && now.Sub(service.unneededSince) >= app.IdleTimeout
 			}
 			if service.config.Startup && available <= 1 {

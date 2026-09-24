@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -57,14 +58,14 @@ func TestRuntimeLifecycle(t *testing.T) {
 					if protocol == "h2c" {
 						workerEnv["TEST_NODE_H2C"] = "1"
 					}
-					runRuntimeLifecycle(t, name, protocol, proxy, command, workerEnv)
+					runRuntimeLifecycle(t, name, protocol, proxy, command, workerEnv, true)
 				})
 			}
 		}
 	}
 }
 
-func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []string, workerEnv map[string]string) {
+func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []string, workerEnv map[string]string, inherited bool) {
 	t.Helper()
 	proxyExecutable := os.Getenv("OOTH_TEST_" + strings.ToUpper(proxy))
 	if proxy != "direct" && proxyExecutable == "" {
@@ -83,6 +84,11 @@ func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []s
 	}
 	address := freeAddress(t)
 	app := App{Name: "worker", Command: command, Env: workerEnv, Listen: Socket{"tcp", address}, Ready: "event", MaxWorkers: 2, Concurrency: 1, ScaleAt: 80, ScaleWindow: 100 * time.Millisecond, IdleTimeout: 1500 * time.Millisecond, StartTimeout: 5 * time.Second, StopTimeout: 3 * time.Second}
+	if !inherited {
+		app.Listen = Socket{}
+		app.MinWorkers = 1
+		app.Vars = map[string]string{"endpoint": "tcp://" + address}
+	}
 	if proxy != "direct" {
 		app.Requires = []string{"proxy"}
 	}
@@ -190,10 +196,12 @@ func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []s
 	if proxy != "direct" {
 		wait("proxy not ready", func() bool { result := fetch("/health"); return result.err == nil && result.body == "ready" })
 	}
-	if log.state("worker").spawned != 0 {
+	if inherited && log.state("worker").spawned != 0 {
 		t.Fatal("worker started before demand")
 	}
-	if proxy == "direct" {
+	if !inherited {
+		wait("minimum worker not ready", func() bool { return log.state("worker").telemetry == 1 })
+	} else if proxy == "direct" {
 		// Load completion is visible through the service log, without a probe connection.
 		wait("listener not ready", func() bool {
 			log.mu.Lock()
@@ -232,10 +240,41 @@ func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []s
 	if len(pids) != 2 {
 		t.Fatalf("new worker never served: %v", pids)
 	}
-	wait("idle workers did not return to zero", func() bool { return log.state("worker").live == 0 })
-	next := check(fetch(prefix + "/0"))
-	if pids[next] {
-		t.Fatal("idle worker was not replaced")
+	var next string
+	if inherited {
+		wait("idle workers did not return to zero", func() bool { return log.state("worker").live == 0 })
+		next = check(fetch(prefix + "/0"))
+		if pids[next] {
+			t.Fatal("idle worker was not replaced")
+		}
+	} else {
+		wait("idle workers did not return to minimum one", func() bool { return log.state("worker").live == 1 })
+		next = check(fetch(prefix + "/0"))
+		if !pids[next] {
+			t.Fatal("minimum worker was unnecessarily replaced")
+		}
+		wait("minimum response telemetry not complete before crash", func() bool {
+			state := log.state("worker")
+			return state.starts == state.ends
+		})
+		// The minimum must restart a crashed ordinary process without socket demand.
+		pid, _ := strconv.Atoi(strings.TrimPrefix(next, "worker="))
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spawned := log.state("worker").spawned
+		if err := process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		process.Release()
+		wait("minimum worker did not restart", func() bool {
+			state := log.state("worker")
+			return state.live == 1 && state.spawned > spawned && state.telemetry == state.spawned
+		})
+		if check(fetch(prefix+"/0")) == next {
+			t.Fatal("crashed worker was not replaced")
+		}
 	}
 	var websocket *testWebSocket
 	if protocol == "http1" && name != "PYTHON" {
@@ -265,5 +304,9 @@ func runRuntimeLifecycle(t *testing.T, name, protocol, proxy string, command []s
 		t.Log("WebSocket upgrade, text/binary echo, ping/pong, idle survival and bidirectional close handshake")
 	}
 	check(<-replies)
-	t.Log("cold/hot response, automatic growth, both PIDs, balanced events, idle zero, reactivation and active-request drain")
+	if inherited {
+		t.Log("cold/hot response, automatic growth, both PIDs, balanced events, idle zero, reactivation and active-request drain")
+	} else {
+		t.Log("worker-owned listeners: minimum one, growth, both PIDs, balanced events, idle one, crash restart and drain")
+	}
 }

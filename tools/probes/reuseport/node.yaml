@@ -1,0 +1,13 @@
+name: worker-owned-node
+command: [node, ../node_worker.cjs]
+vars:
+  endpoint: tcp://127.0.0.1:8080
+env:
+  TEST_BIND_URL: "{{.vars.endpoint}}"
+min_workers: 1
+max_workers: 4
+concurrency: 1
+scale_at: 80%
+scale_window: 1s
+idle_timeout: 1m
+ready: event

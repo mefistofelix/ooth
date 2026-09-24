@@ -4,9 +4,15 @@ The target is TrueAsync's built-in HTTP/1.1 + HTTP/2 server adopting ooth's
 listener, one PHP server thread with coroutines, request telemetry and graceful
 shutdown. The current extra-handle convention avoids the historical stdin
 failure below. **Windows now passes the full ooth lifecycle through a private
-FFI hook; Linux's released binary lacks FFI and remains limited to async accept.**
+FFI hook; Linux's released binary lacks FFI and inherited-listener tests remain limited to async accept.**
 No runtime is recompiled, as explicitly requested. Independent control listeners
 are diagnostics, not replacements for socket activation.
+
+Separately, the [worker-owned listener suite](../reuseport/README.md) now runs
+Linux TrueAsync's native HTTP/1.1, h2c and WebSocket server with full pool growth,
+idle minimum one, restart and drain through both proxies. That path calls public
+`addListener`, needs no FFI, and changes no runtime binary. It does not resolve
+the inherited-listener limitation or activate from zero.
 
 `worker.php` is the new protocol worker. The [common matrix](../runtime/README.md)
 checks HTTP/1.1 and h2c directly and through Caddy/Nginx, cold activation, growth,

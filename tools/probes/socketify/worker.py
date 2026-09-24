@@ -9,6 +9,7 @@ import sys
 import asyncio
 import threading
 import time
+from urllib.parse import urlparse
 
 from socketify import App
 from socketify.native import ffi, lib, library_path
@@ -63,7 +64,6 @@ def adopt_listener(app, handle):
 protocol = os.environ.get("TEST_OOTH_PROTOCOL") == "1"
 if not protocol and sys.stdin.readline() != "ordinary stdin\n":
     raise RuntimeError("Ordinary stdin is not usable")
-handle = int(os.environ["OOTH_LISTEN_HANDLE"])
 app = App()
 active = 0
 sequence = 0
@@ -124,8 +124,15 @@ if protocol:
     app.ws("/ws", {"open": ws_open, "message": lambda ws, message, opcode: ws.send(message, opcode), "close": ws_close})
 else:
     app.get("/", lambda response, request: response.end(f"{os.getpid()}\n"))
-temporary = adopt_listener(app, handle)
-print(f"adopted inherited={handle} closed_temporary={temporary}", file=sys.stderr, flush=True)
+if "TEST_BIND_URL" in os.environ:
+    address = urlparse(os.environ["TEST_BIND_URL"])
+    app.listen({"host": address.hostname, "port": address.port}, lambda config: None)
+    if app.socket == ffi.NULL:
+        raise RuntimeError("Socketify could not bind the configured address")
+else:
+    handle = int(os.environ["OOTH_LISTEN_HANDLE"])
+    temporary = adopt_listener(app, handle)
+    print(f"adopted inherited={handle} closed_temporary={temporary}", file=sys.stderr, flush=True)
 
 def stop(signum=None, frame=None):
     global stopping

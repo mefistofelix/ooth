@@ -4,6 +4,8 @@ Minimal process supervisor with lazy socket activation, written in Go. The super
 
 ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool; each worker inherits an additional listener handle, reads its number from `OOTH_LISTEN_HANDLE`, and accepts connections itself. Legacy stdin handoff is configurable. **ooth never accepts, reads, copies, or proxies application traffic.** “Copyless” here means no forwarding through the supervisor, not that the operating system or application performs no copies.
 
+An app without `listen` runs as an ordinary process pool. The same minimum, maximum, telemetry, scaling and shutdown rules apply; the program can open its own listener. There is no special reuseport mode in ooth.
+
 This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. It does not mount filesystems, configure the machine, or implement a service manager for Windows SCM.
 
 ## Build and run
@@ -15,6 +17,8 @@ The [Socketify ctypes adapter](tools/probes/socketify/README.md) uses the actual
 The [JavaScript adapters](tools/probes/javascript/README.md) use a private binding for Node on Windows, Bun's fd-capable TCP server on Linux and FFI accept thread on Windows, and FFI Winsock accept for Deno Windows. They feed the runtimes' HTTP compatibility servers; Deno's direct Windows listener adoption still fails. The bounded WebSocket fixture uses the HTTP upgrade event. These runtime adapters remain experimental.
 
 [TrueAsync Windows](tools/probes/trueasync/README.md) also has an ooth protocol worker using its built-in HTTP/1.1, h2c and WebSocket server through a private FFI hook. The released Linux binary is static and lacks FFI, so native HTTP-server adoption remains blocked there; only async accept is verified. The user chose no runtime recompilation. Stock PHP-CGI remains FastCGI without telemetry, with its existing Windows launcher.
+
+The separate [worker-owned listener suite](tools/probes/reuseport/README.md) tests ordinary process pools whose workers bind their own TCP sockets on Linux. It includes TrueAsync's native server without FFI. Its tests, results and generated configurations are distinct from the inherited-socket matrix above.
 
 ```sh
 bash ./build.sh
@@ -93,6 +97,31 @@ Listener notifications activate empty pools; they do not measure universal reque
 
 Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers count against `max_workers`, so an update can queue requests while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
 
+### Arguments and environment placeholders
+
+Every element of `command` and every value in `env` supports Go `text/template`
+expressions. This applies to socket workers and ordinary processes, on every
+spawn and restart. Each expanded argument stays one argument: spaces are
+preserved, `$NAME` is literal, and no shell or recursive expansion is involved.
+Unknown dot-notation fields or malformed templates reject the configuration.
+Expansion errors name the affected field without printing its value.
+
+| Placeholder | Value |
+| --- | --- |
+| `{{.name}}` | Configured application name. |
+| `{{.directory}}`, `{{.source}}` | Resolved working directory and application YAML path. |
+| `{{.env.NAME}}` | Environment inherited by ooth; this does not reference the app's `env` map. |
+| `{{.vars.NAME}}` | Literal string from the app's optional `vars` map, reusable across arguments and environment. |
+| `{{.listen.network}}`, `{{.listen.address}}`, `{{.listen.url}}` | Inherited listener metadata, available only with `listen`. URLs use `tcp://` or `unix://` and escape paths. |
+| `{{.listen.host}}`, `{{.listen.port}}` | TCP listener host and port, including the actual assigned port when binding port zero. |
+| `{{.listen.path}}` | Resolved Unix socket path. |
+
+Only `command` and `env` values are expanded; `vars`, `directory`, `ready` and
+`listen` remain literal configuration. Validation uses the configured address;
+spawn uses the bound listener's actual address. Quote expressions in YAML.
+For example, an argument `"--endpoint={{.vars.endpoint}}"` and environment value
+`ENDPOINT: "{{.vars.endpoint}}"` receive the same string.
+
 ## Process identity
 
 Application YAML may select an account for both socket workers and ordinary services. Omit these fields to inherit ooth's identity:
@@ -141,15 +170,56 @@ The first demand for `web` activates `database` and `cache` together. `web` star
 - `ready: tcp://host:port` or `unix://path`: connect to the endpoint until it responds. Probes establish and close a real connection, so use an endpoint that tolerates that.
 - `startup: true`: activate at supervisor startup and keep at least one worker.
 
-Virtual services have `max_workers: 1`. They remain running while needed, then stop after their idle timeout. Losing a prerequisite stops dependent workers; demand reactivates the dependency graph. Supervisor shutdown drains dependents before prerequisites. The scheduler does not require unrelated branches to wait for one another.
+Virtual services default to `max_workers: 1`, but can use larger pools. They remain running while required. Without telemetry, retirement follows dependency demand; with telemetry, idle workers retire down to the configured minimum or the one process retained for a required dependency/startup service. Losing a prerequisite stops dependent workers; demand reactivates the dependency graph. Supervisor shutdown drains dependents before prerequisites. The scheduler does not require unrelated branches to wait for one another.
+
+### Programs that open their own listeners
+
+Omit `listen` and configure the ordinary pool and the worker's own arguments:
+
+```yaml
+name: web
+vars:
+  endpoint: tcp://127.0.0.1:8080
+command: [node, /path/to/ooth/tools/probes/node_worker.cjs]
+env:
+  TEST_BIND_URL: "{{.vars.endpoint}}"
+min_workers: 1
+max_workers: 4
+concurrency: 1
+scale_at: 80%
+scale_window: 1s
+idle_timeout: 1m
+ready: event
+```
+
+This example uses the repository's Linux Node test worker, which requests
+`reusePort` itself. Other programs have their own options. ooth neither opens
+a socket nor sets reuseport here; stdout telemetry drives growth and stdin
+requests graceful retirement just as for inherited workers. The user must choose
+an endpoint, runtime and OS that support multiple independent listeners. Socket
+ownership and permissions also belong to the program that creates the socket.
+
+Without an ooth listener, arriving connections cannot activate a zero-sized
+pool. Keep `min_workers: 1` (or higher) for an independently reachable service.
+The minimum restarts after a crash, with the normal restart backoff; it is not
+a guarantee of zero downtime. Setting `min_workers: 1` on an app **with** `listen`
+still creates and inherits that listener: these settings control different things.
+
+Linux TCP reuseport listeners have separate accept queues. A connection already
+queued on ooth's own listener would not be picked up merely by binding another
+socket to its port. The [saved queue probe](tools/probes/reuseport/README.md)
+demonstrates this distinction and lists runtime/OS limits. No sysctl or eBPF
+migration is configured; Windows `SO_REUSEADDR` and filesystem Unix sockets are
+not treated as equivalent reuseport groups.
 
 ## Generic worker protocol: spawn, environment and stdio
 
 The convention is language-independent and requires no ooth client library.
-ooth starts a foreground process, supplies an already-listening socket, observes
-its exit through the operating system, and optionally reads its request events.
-Workers accept and handle traffic directly. They must not bind a replacement
-socket, close the supervisor's copy, or daemonize away from the managed process.
+ooth starts a foreground process, observes its exit through the operating system,
+and optionally reads its request events. With `listen`, it also supplies an
+already-listening socket; that worker must adopt it rather than bind a replacement.
+Without `listen`, the program owns its listener or other work source. Workers
+handle traffic directly and must not daemonize away from the managed process.
 
 ### Environment and inherited listener
 
@@ -183,7 +253,7 @@ is supplied for that listener. Configuration cannot override `OOTH_*` variables.
 
 ### Startup and request events
 
-1. Read the inherited listener number from `OOTH_LISTEN_HANDLE`: a file descriptor on Linux or native SOCKET on Windows. Adopt it using the runtime's socket API. With explicit `socket_handoff: stdin`, recover fd 0 / `STD_INPUT_HANDLE` instead.
+1. With an inherited listener, read `OOTH_LISTEN_HANDLE`: a file descriptor on Linux or native SOCKET on Windows. Adopt it using the runtime's socket API. With explicit `socket_handoff: stdin`, recover fd 0 / `STD_INPUT_HANDLE` instead. An app without `listen` initializes its own work source.
 2. To opt into request telemetry, make the first stdout line the `ready` handshake below. This detection is independent of the configured readiness gate. Send logs to stderr after opting in.
 3. Emit `start` and `end` for every request. Flush each complete line. Concurrent workers must serialize writes to their own event stream.
 4. After the handshake, read the `v=1 event=stop ts=...` command from stdin, stop accepting new requests, finish active requests, then exit. Handle OS graceful notifications too, for legacy stdin handoff or shutdown before the handshake.

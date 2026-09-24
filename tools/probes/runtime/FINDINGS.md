@@ -118,3 +118,36 @@ Cold/hot responses are correctness checks. These logs are not cold-start or
 throughput benchmarks, and the private adapters are not production stability
 certifications. TCP loopback is the shared matrix; separate Go-worker tests
 cover Unix listeners and permissions. ARM64 remains cross-compile-only.
+
+## Workers binding their own TCP sockets: separate suite
+
+The [worker-owned listener suite](../reuseport/README.md) has its own test entry
+point, results and artifacts. It does not replace this inherited-socket matrix.
+Linux passed 27 cases with minimum one, growth, two serving PIDs, idle one,
+crash restart and active drain. The following distinctions matter for the stack:
+
+- SO_REUSEPORT groups independently bound listeners with separate accept queues.
+  The saved `queue.py` probe connects before starting the second listener; that
+  connection stays on the first. New connections reach both queues. Leaving a
+  supervisor listener open without accepting can therefore strand more clients
+  than just the initial activation request. No kernel migration was enabled.
+- ooth receives no listener events in these apps: there is no `listen` setting.
+  Minimum processes start proactively and telemetry drives growth. The runtime
+  enables reuseport and binds; ooth adds no dedicated mode. Request/session
+  pinning still applies after connections have been distributed.
+- Bun.serve and Deno.serve now have native HTTP/WS coverage in this separate
+  Linux suite. Deno's public reusePort option needs `--unstable-net`; the first
+  probe failed at that explicit runtime gate, before serving. Deno h2c passed.
+- Socketify uses public listen and Linux uSockets reuseport here, not ctypes
+  adoption. TrueAsync Linux uses public addListener, which permits testing the
+  native HTTP/1.1, h2c and WS server without FFI or any runtime compilation.
+  The official binary's inherited-server adoption limit remains unchanged.
+- The initial Node crash check killed the minimum immediately after receiving
+  a response, before its end event reached ooth. Waiting for that event before
+  the intentional idle crash fixed the harness's event-balance assertion;
+  response arrival and stdout delivery are independent streams. A real crash
+  can of course interrupt an active request; this test does not promise otherwise.
+- Windows skips this native reuseport matrix, rather than treating SO_REUSEADDR
+  as equivalent. Generic no-listener process pools, placeholders and restart
+  still have native Windows tests. Inherited workers remain separately verified
+  on Windows, with all 30 existing cases passing after the fixture changes.

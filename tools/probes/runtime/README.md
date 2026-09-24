@@ -5,6 +5,11 @@ started only by socket demand and the occupancy policy, never by the harness.
 The same lifecycle runs directly, through Caddy, and through Nginx; ooth also
 starts and supervises the proxy. Loopback TCP is used throughout.
 
+This matrix is exclusively for inherited sockets. Ordinary pools whose workers
+bind their own listeners have a separate [suite and results](../reuseport/README.md),
+`TestWorkerOwnedListeners`; they keep a minimum of one and do not test cold
+socket activation or idle zero.
+
 Final local run on 2026-09-24: **30 Windows cases passed; 24 Linux cases passed,
 with six explicit TrueAsync skips**. [results.csv](results.csv) saves the result
 for each runtime/protocol/route, without machine-specific paths or claiming

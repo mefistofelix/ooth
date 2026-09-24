@@ -1,6 +1,10 @@
 // Test adapter: the environment carries an inherited fd (Linux) or SOCKET
 // (Windows). The stdin path remains for explicit legacy activation fixtures.
 function listenOptions() {
+  if (process.env.TEST_BIND_URL) {
+    const address = new URL(process.env.TEST_BIND_URL);
+    return { host: address.hostname.replace(/^\[|\]$/g, ''), port: Number(address.port), reusePort: true };
+  }
   let descriptor = Number(process.env.OOTH_LISTEN_HANDLE ?? 0);
   if (process.platform !== 'win32') return { fd: descriptor };
   if (process.env.OOTH_LISTEN_HANDLE === undefined) {
@@ -19,7 +23,7 @@ function listenOptions() {
 }
 
 function watchStop(stop) {
-  if (process.env.OOTH_LISTEN_HANDLE === undefined) return null;
+  if (process.env.OOTH_LISTEN_HANDLE === undefined && !process.env.TEST_BIND_URL) return null;
   const input = require('node:readline').createInterface({ input: process.stdin });
   // readline.close() alone leaves the pipe handle alive on Windows.
   input.once('close', () => process.stdin.destroy());
