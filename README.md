@@ -664,6 +664,12 @@ cannot be guaranteed: SCM does not guarantee a valid PID in pending states,
 as documented for [QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex).
 SCM services are created by Windows outside
 ooth's worker Job, so this path does not claim Job-based descendant ownership.
+ooth acts as a service control client: `StartService` asks the system SCM to
+launch the registered executable, and `ControlService` sends its stop request.
+This is not a private SCM for ordinary child processes. A service executable's
+[`StartServiceCtrlDispatcher`](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-startservicectrldispatcherw)
+connects to the Windows SCM; the documented interface does not select ooth as
+an alternative dispatcher endpoint.
 
 The caller needs service query/start/stop rights and terminate access to the
 service process. ooth does not register services, change accounts or recovery
@@ -676,10 +682,13 @@ already implement the SCM protocol.
 read-only native subscription. `TestSCMProcessHandleTermination` verifies forceful
 termination with a real process and retained handle; `TestSCMPendingPIDIsNotTrusted`
 checks that pending-state PIDs are ignored. `TestSCMLifecycle` creates/removes a temporary
-service and tests real start, graceful stop and forced termination; it is skipped
-in the current non-elevated session because service creation is denied. Run it
-from an appropriately privileged Windows test session before treating the full
-SCM lifecycle as verified. `x/sys/windows/svc` was already present in the pinned
+service and tests real start, graceful stop and forced termination. On 2026-09-24
+the entire `TestSCM` group passed in a local Windows amd64 session elevated through
+user-approved UAC, including both native lifecycle cases. Cleanup verification
+found no remaining temporary service. This covers the real service host and
+controller; it does not establish live SCM readiness/action-hook integration.
+The lifecycle test still skips in sessions without service-creation permission.
+`x/sys/windows/svc` was already present in the pinned
 module graph; it is now a direct dependency, with no new module or CGO.
 
 From an elevated PowerShell in the repository, the native test command is:
