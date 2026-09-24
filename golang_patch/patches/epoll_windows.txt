@@ -1,7 +1,7 @@
 //go:build windows && (amd64 || arm64)
 
 // AFD protocol and event mapping follow wepoll by Bert Belder.
-// See THIRD_PARTY_NOTICES.md in the ooth source distribution for its license.
+// See the third-party licenses in the ooth README.md for its license.
 
 package syscall
 

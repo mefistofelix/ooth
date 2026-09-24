@@ -54,7 +54,7 @@ printf '%s\n' "$patch_hash" > "$directory/.patch-version"
 "$compiler" run ./test/run.go vet ./...
 
 version=${VERSION:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo dev)}
-cp src/THIRD_PARTY_NOTICES.md bin/THIRD_PARTY_NOTICES.md
+cp README.md bin/README.md
 for target_arch in amd64 arm64; do
   suffix=''
   if [[ $host_os == windows ]]; then suffix=.exe; fi

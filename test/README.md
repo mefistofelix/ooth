@@ -28,6 +28,8 @@ and artifact paths must be absolute. The default build skips suites whose
 runtimes have not been selected.
 
 Downloaded runtimes, reference source checkouts and generated logs/configurations
-belong in the root `tmp/` directory, which Git ignores. They can be regenerated
-using the preparation instructions. The root `build/` directory is reserved for
+belong in the root `tmp/` directory, which Git ignores. It can be deleted when no build or test is running; saved local traces are then lost.
+The runner recreates the directory and transient test files automatically. External
+runtimes and reference checkouts are not downloaded by the tests: rerun their
+preparation instructions before enabling those integrations again. The root `build/` directory is reserved for
 the Go toolchains; `bin/` holds ooth release binaries.

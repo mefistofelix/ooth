@@ -17,6 +17,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Preserve repository line endings
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -44,7 +47,7 @@ jobs:
           name: ${{ runner.os }}
           path: |
             bin/ooth-*
-            bin/THIRD_PARTY_NOTICES.md
+            bin/README.md
 
   release:
     if: inputs.publish_release
@@ -65,7 +68,7 @@ jobs:
           sha256sum ooth-* > SHA256SUMS
           tag="${GITHUB_SHA:0:12}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" ooth-* SHA256SUMS THIRD_PARTY_NOTICES.md --clobber
+            gh release upload "$tag" ooth-* SHA256SUMS README.md --clobber
           else
-            gh release create "$tag" ooth-* SHA256SUMS THIRD_PARTY_NOTICES.md --target "$GITHUB_SHA" --title "ooth $tag" --notes 'Experimental Linux and Windows builds. See README for worker conventions and platform limitations.' --prerelease
+            gh release create "$tag" ooth-* SHA256SUMS README.md --target "$GITHUB_SHA" --title "ooth $tag" --notes 'Experimental Linux and Windows builds. See README for worker conventions and platform limitations.' --prerelease
           fi
