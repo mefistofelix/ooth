@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -142,12 +143,48 @@ func socketSecurity(t *testing.T, path string) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return owner.String(), socketPermissionSDDL(t, descriptor)
+}
+
+func socketPermissionSDDL(t *testing.T, descriptor *windows.SECURITY_DESCRIPTOR) string {
+	t.Helper()
 	// Windows may record automatic inheritance during SetSecurityInfo. Compare
 	// owner, every ACE and DACL protection, not this inheritance-history bit.
 	if err := descriptor.SetControl(windows.SE_DACL_AUTO_INHERITED, 0); err != nil {
 		t.Fatal(err)
 	}
-	return owner.String(), descriptor.String()
+	// String() includes every available field, even ones GetSecurityInfo was
+	// not asked to retrieve. Request only the owner and DACL being tested.
+	var text *uint16
+	convert := jobSecurity.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")
+	information := windows.OWNER_SECURITY_INFORMATION | windows.DACL_SECURITY_INFORMATION
+	if ok, _, err := convert.Call(uintptr(unsafe.Pointer(descriptor)), 1, uintptr(information), uintptr(unsafe.Pointer(&text)), 0); ok == 0 {
+		t.Fatal(err)
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(text)))
+	return windows.UTF16PtrToString(text)
+}
+
+func TestSocketPermissionComparison(t *testing.T) {
+	baseline := "O:SYD:P(A;;FA;;;SY)"
+	for _, test := range []struct {
+		sddl  string
+		equal bool
+	}{
+		{"O:SYG:BAD:PAI(A;;FA;;;SY)", true},
+		{"O:BAD:P(A;;FA;;;SY)", false},
+		{"O:SYD:P(A;;FR;;;SY)", false},
+		{"O:SYD:(A;;FA;;;SY)", false},
+		{"O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)", false},
+	} {
+		descriptor, err := windows.SecurityDescriptorFromString(test.sddl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if equal := socketPermissionSDDL(t, descriptor) == baseline; equal != test.equal {
+			t.Errorf("comparison of %s: equal=%v, want %v", test.sddl, equal, test.equal)
+		}
+	}
 }
 
 func TestSocketIdentityWindows(t *testing.T) {
