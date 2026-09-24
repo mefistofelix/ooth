@@ -22,12 +22,11 @@ esac
 archive="go1.27.1.$host_os-$host_arch.$extension"
 directory="$PWD/build/$host_os-$host_arch"
 mkdir -p "$directory" bin
-printf 'module ooth-build-cache\n\ngo 1.27.0\n' > build/go.mod
 if [[ ! -f "$directory/$archive" ]]; then
   curl --fail --location --retry 3 "https://go.dev/dl/$archive" -o "$directory/$archive"
 fi
 # Re-extract when the patch changes so removed edits cannot survive an upgrade.
-patch_hash=$(cat tools/patchgo/main.go tools/patchgo/patches/*.txt | sha256sum | cut -d ' ' -f 1)
+patch_hash=$(cat golang_patch/main.go golang_patch/patches/*.txt | sha256sum | cut -d ' ' -f 1)
 if [[ ! -f "$directory/.patch-version" || $(cat "$directory/.patch-version") != "$patch_hash" ]]; then
   printf '%s  %s\n' "$checksum" "$directory/$archive" | sha256sum --check
   restore=()
@@ -48,17 +47,17 @@ if [[ $host_os == windows ]]; then GOROOT=$(cygpath -w "$GOROOT"); fi
 export CGO_ENABLED=0 GOTOOLCHAIN=local
 unset GOOS GOARCH
 compiler="$directory/go/bin/go"
-"$compiler" run ./tools/patchgo -goroot "$GOROOT"
+"$compiler" run ./golang_patch/main.go -goroot "$GOROOT"
 printf '%s\n' "$patch_hash" > "$directory/.patch-version"
-"$compiler" mod verify
-"$compiler" test -timeout 60s ./...
-"$compiler" vet ./...
+"$compiler" -C src mod verify
+"$compiler" run ./test/run.go test -timeout 60s ./...
+"$compiler" run ./test/run.go vet ./...
 
 version=${VERSION:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo dev)}
 cp THIRD_PARTY_NOTICES.md bin/THIRD_PARTY_NOTICES.md
 for target_arch in amd64 arm64; do
   suffix=''
   if [[ $host_os == windows ]]; then suffix=.exe; fi
-  GOOS=$host_os GOARCH=$target_arch "$compiler" build -trimpath \
-    -ldflags="-s -w -X main.version=$version" -o "bin/ooth-$host_os-$target_arch$suffix" .
+  GOOS=$host_os GOARCH=$target_arch "$compiler" -C src build -trimpath \
+    -ldflags="-s -w -X main.version=$version" -o "../bin/ooth-$host_os-$target_arch$suffix" .
 done

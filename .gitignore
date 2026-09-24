@@ -2,3 +2,4 @@
 /build/
 *.test
 *.test.exe
+/tmp/
