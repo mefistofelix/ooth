@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -168,6 +169,117 @@ func TestIdentityConfigAndErrors(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), password) {
 			t.Fatal("YAML diagnostic disclosed password")
+		}
+	}
+}
+
+func TestMachinePasswordSyspermCompatibility(t *testing.T) {
+	// Public fixture: sysperm's label (with NUL) followed by bytes 00 through 1f.
+	secret := "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	const expected = "Sp!9e30ca5f9c10d6dd0ce2169670a5c24d8aA0!"
+	for _, encoded := range []string{secret, strings.ToUpper(secret)} {
+		password, err := machinePassword(encoded)
+		if err != nil || password != expected {
+			t.Fatal("password differs from sysperm's byte format")
+		}
+	}
+	changed, err := machinePassword(strings.Repeat("ab", 32))
+	if err != nil || changed == expected {
+		t.Fatal("changing the secret must change the password")
+	}
+}
+
+func TestIdentityDefaultPasswordConfig(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "ooth.yaml")
+	secret := strings.Repeat("ab", 32)
+	root := "watch: ['apps/*.yaml']\nwindows_password_secret: '" + secret + "'\n"
+	write(t, path, root)
+	write(t, filepath.Join(directory, "apps", "alice.yaml"), "name: alice\ncommand: [worker]\nuser: alice\n")
+	write(t, filepath.Join(directory, "apps", "bob.yaml"), "name: bob\ncommand: [worker]\nuser: bob\n")
+	write(t, filepath.Join(directory, "apps", "current.yaml"), "name: current\ncommand: [worker]\n")
+	if runtime.GOOS == "windows" {
+		write(t, filepath.Join(directory, "apps", "explicit.yaml"), "name: explicit\ncommand: [worker]\nuser: alice\npassword: override\n")
+		write(t, filepath.Join(directory, "apps", "empty.yaml"), "name: empty\ncommand: [worker]\nuser: alice\npassword: ''\n")
+	}
+	first, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, _ := machinePassword(secret)
+	for _, name := range []string{"alice", "bob"} {
+		app := first.Apps[name]
+		if runtime.GOOS == "windows" {
+			if app.Identity.Password == nil || *app.Identity.Password != expected {
+				t.Fatal("missing derived password")
+			}
+		} else if app.Identity.Password != nil {
+			t.Fatal("Windows default affected Linux credentials")
+		}
+		if _, exists := app.Values["password"]; exists {
+			t.Fatal("derived password leaked into YAML placeholder values")
+		}
+		command, environment, err := app.expandLaunch("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := append([]string(nil), command...)
+		for _, value := range environment {
+			values = append(values, value)
+		}
+		for _, value := range values {
+			if strings.Contains(value, expected) || strings.Contains(value, secret) {
+				t.Fatal("credentials leaked into process arguments or environment")
+			}
+		}
+	}
+	if first.Apps["current"].Identity.Password != nil {
+		t.Fatal("default password requires an explicit user")
+	}
+	if runtime.GOOS == "windows" {
+		for name, expected := range map[string]string{"explicit": "override", "empty": ""} {
+			password := first.Apps[name].Identity.Password
+			if password == nil || *password != expected {
+				t.Fatal("explicit password must take precedence, including empty")
+			}
+		}
+	}
+	write(t, path, strings.Replace(root, secret, strings.Repeat("cd", 32), 1))
+	second, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, app := range first.Apps {
+		changed := !reflect.DeepEqual(app, second.Apps[name])
+		if changed != (runtime.GOOS == "windows" && (name == "alice" || name == "bob")) {
+			t.Fatalf("secret rotation changed the wrong application: %s", name)
+		}
+	}
+	write(t, path, "watch: ['apps/*.yaml']\n")
+	withoutSecret, err := Load(path)
+	if err != nil || withoutSecret.Apps["alice"].Identity.Password != nil {
+		t.Fatal("omitted secret must preserve existing password-free behavior")
+	}
+}
+
+func TestIdentitySecretErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ooth.yaml")
+	for _, secret := range []string{"", "not-a-hex-secret", strings.Repeat("a", 63), strings.Repeat("a", 66)} {
+		write(t, path, "watch: ['apps/*.yaml']\nwindows_password_secret: '"+secret+"'\n")
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "windows_password_secret") {
+			t.Fatal("invalid secret must reject configuration with a field-specific error")
+		}
+		if secret != "" && strings.Contains(err.Error(), secret) {
+			t.Fatal("invalid secret disclosed in diagnostics")
+		}
+	}
+	secret := strings.Repeat("ab", 32)
+	for _, field := range []string{"['" + secret + "']", "'" + secret} {
+		write(t, path, "watch: ['apps/*.yaml']\nwindows_password_secret: "+field+"\n")
+		_, err := Load(path)
+		if err == nil || strings.Contains(err.Error(), secret) {
+			t.Fatal("malformed secret YAML must fail without disclosing its contents")
 		}
 	}
 }

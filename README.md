@@ -382,9 +382,41 @@ password: 'account-password'
 
 Linux sets the UID, primary GID and account's supplementary groups in the child. The primary group defaults to the account's group. An unprivileged caller retaining its own UID keeps its existing supplementary groups. Changing identity requires the corresponding OS permissions. With CGO disabled, account lookup uses `/etc/passwd` and `/etc/group`, not NSS plugins.
 
-Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and listener inheritance. A different account requires `password`; an explicit empty string is passed as an empty password. The current account can be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
+Windows authenticates with `LogonUserW` (batch logon) and passes the primary token through Go's existing `SysProcAttr.Token` to `CreateProcessAsUser`, retaining atomic Job assignment and listener inheritance. A different account requires either an app `password` or the global default described below; an explicit empty string is passed as an empty password. With neither configured, the current account can still be named without a password. The target needs the **Log on as a batch job** right, and the caller needs the privileges required by [CreateProcessAsUser](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw), typically a suitably configured service account. ooth does not grant those rights or retry with its own identity if authentication or creation fails.
 
-The password is read directly from YAML as requested; restrict that file's permissions. It is not placed in the worker's arguments or environment, and YAML diagnostics omit source excerpts. This switches process credentials, without loading a Windows profile or constructing a login environment; use `env` and `directory` for application settings. Linux rejects `password`; Windows rejects `group`. Linux different-user listener inheritance was tested locally; Windows current-user inheritance and authentication failures passed, while a successful different-account Windows spawn still needs validation with a suitable account. `OOTH_TEST_WINDOWS_USER` and `OOTH_TEST_WINDOWS_PASSWORD` enable that optional test only.
+To derive a default Windows password, add this optional field to the **main** YAML:
+
+```yaml
+windows_password_secret: '<64 hexadecimal characters encoding a 32-byte secret>'
+```
+
+Replace the placeholder with a private random secret, or the hexadecimal encoding
+of an existing sysperm secret (`%ProgramData%/sysperm/secret` contains the raw
+32 bytes). ooth uses exactly [sysperm's password format](https://github.com/mefistofelix/sysperm/blob/36930d0f9bc8dda052b59f060dafa98450fe6857/src/main.c):
+
+```text
+"Sp!9" + lowercase_hex(MD5("sysperm-password-v1" + NUL + raw_secret)) + "aA0!"
+```
+
+The result is 40 characters. The username is not part of this formula: accounts
+using the same secret get the same default password, compatible with sysperm.
+An explicit app `password`, including `''`, takes precedence. Otherwise the
+default applies to Windows apps with `user`, including their command actions;
+apps without `user` retain ooth's identity. Linux validates the secret's format
+but does not use it for credentials. Omit the field to disable derivation; an
+empty or malformed value is rejected.
+
+The account must already exist and its Windows password must match. ooth only
+uses the derived credential: it does not create accounts or change passwords.
+Changing the secret reloads apps that use the derived default, so coordinate
+rotation with account provisioning; apps with explicit passwords are unaffected.
+The global secret is a credential, not a public salt: protect the main YAML as
+well as app files containing explicit passwords. Neither the global secret nor
+the computed password is added to `.config`/`.runtime` placeholders, command
+arguments or environment. The original app YAML remains visible through
+`.config`, including an explicitly configured password if deliberately referenced.
+
+YAML diagnostics omit source excerpts to avoid disclosing credentials. This switches process credentials, without loading a Windows profile or constructing a login environment; use `env` and `directory` for application settings. Linux rejects app `password`; Windows rejects `group`. Linux different-user listener inheritance was tested locally; Windows current-user inheritance and authentication failures passed, while a successful different-account Windows spawn still needs validation with a suitable account. `OOTH_TEST_WINDOWS_USER` and `OOTH_TEST_WINDOWS_PASSWORD` enable that optional test only. The derived default has native Windows/Linux configuration, precedence, rotation, redaction and sysperm-format tests; those do not constitute a successful different-account Windows logon test.
 
 The same identity owns the **filesystem Unix socket** used for activation. Linux applies UID/GID and `socket_mode`, defaulting to `0660`; this optional field accepts permission bits `0000` through `0777` and is rejected for TCP or Windows. Windows sets the account as owner and a protected ACL granting full access to that account, ooth's account and SYSTEM. Without an explicit identity, these defaults use ooth's current account/group. TCP listeners have no filesystem owner or mode. An ownership/permission error rejects the configuration; it does not silently expose the socket with different permissions. Identity and mode changes update a reused Unix listener, with permission rollback if the configuration cannot be applied. The socket directory must already allow the intended clients to traverse it and should restrict access during socket creation, before ooth applies the final file permissions. Assigning another Windows owner requires the relevant native ownership rights; ooth does not enable extra privileges automatically.
 

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -91,9 +93,10 @@ func main() {
 }
 
 type Config struct {
-	Watch     []string       `yaml:"watch"`
-	Cgroup    string         `yaml:"cgroup"`
-	Resources ResourceLimits `yaml:"resources"`
+	Watch                 []string       `yaml:"watch"`
+	Cgroup                string         `yaml:"cgroup"`
+	Resources             ResourceLimits `yaml:"resources"`
+	WindowsPasswordSecret *string        `yaml:"windows_password_secret"`
 }
 
 type ResourceLimits struct {
@@ -195,6 +198,20 @@ type Identity struct {
 	User     string  `yaml:"user"`
 	Group    string  `yaml:"group"`
 	Password *string `yaml:"password"`
+}
+
+// Keep the byte format compatible with sysperm's automatic_password, including
+// the C label's trailing NUL. The configured secret encodes its 32 raw bytes.
+func machinePassword(encodedSecret string) (string, error) {
+	secret, err := hex.DecodeString(encodedSecret)
+	if err != nil || len(secret) != 32 {
+		return "", fmt.Errorf("windows_password_secret must contain exactly 64 hexadecimal characters")
+	}
+	defer clear(secret)
+	digest := md5.New()
+	digest.Write([]byte("sysperm-password-v1\x00"))
+	digest.Write(secret)
+	return fmt.Sprintf("Sp!9%xaA0!", digest.Sum(nil)), nil
 }
 
 type Permissions uint32
@@ -818,6 +835,14 @@ func Load(path string) (Snapshot, error) {
 	if err := read(path, &main); err != nil {
 		return Snapshot{}, err
 	}
+	var defaultPassword *string
+	if main.WindowsPasswordSecret != nil {
+		password, err := machinePassword(*main.WindowsPasswordSecret)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("%s: %w", path, err)
+		}
+		defaultPassword = &password
+	}
 	if len(main.Watch) == 0 {
 		return Snapshot{}, fmt.Errorf("%s: watch must contain at least one glob", path)
 	}
@@ -874,6 +899,9 @@ func Load(path string) (Snapshot, error) {
 			}
 			if err := app.validate(); err != nil {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
+			}
+			if runtime.GOOS == "windows" && app.Identity.User != "" && app.Identity.Password == nil {
+				app.Identity.Password = defaultPassword
 			}
 			app.Directory = resolve(filepath.Dir(file), app.Directory)
 			if app.SCM == nil && !strings.Contains(app.Command[0], "{{") && strings.ContainsAny(app.Command[0], `/\`) {
