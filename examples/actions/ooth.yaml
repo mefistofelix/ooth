@@ -1,0 +1,25 @@
+# Run separately with examples/actions-root.yaml; set python3 to your interpreter.
+name: checked-web
+command: [python3, worker.py]
+directory: ..
+listen:
+  network: tcp
+  address: 127.0.0.1:8081
+min_workers: 0
+max_workers: 2
+ready: event
+actions:
+  responding:
+    http:
+      url: 'http://{{.listen.address}}/0'
+      headers: {X-Ooth-Check: '{{.name}}'}
+    expect: {status: [200]}
+    timeout: 2s
+    retries: 1
+    backoff: 100ms
+triggers:
+  readiness:
+    - {action: responding, scope: app, interval: 1s, failure_threshold: 3}
+  health:
+    - {action: responding, scope: app, interval: 30s, failure_threshold: 3}
+# Active HTTP checks create real requests; their frequency affects idle retirement.

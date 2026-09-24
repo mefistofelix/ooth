@@ -289,9 +289,14 @@ func (control *scmControl) run(args []string, report func(svc.Status), logger *s
 	}
 }
 
-func (manager *manager) spawnSCM(service *service, now time.Time) error {
+func (manager *manager) spawnSCM(child *process, now time.Time) error {
+	service := child.service
 	app := service.config
-	args, _, err := app.expandLaunch("")
+	values, err := child.scope.values("launch", now)
+	if err != nil {
+		return err
+	}
+	args, _, err := app.expandCommand(values)
 	if err != nil {
 		return err
 	}
@@ -299,7 +304,8 @@ func (manager *manager) spawnSCM(service *service, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("SCM %q: %w", app.SCM.Name, err)
 	}
-	child := &process{scm: control, service: service, config: app, started: now}
+	child.scm = control
+	child.pending = false
 	manager.workers[child] = struct{}{}
 	service.workers[child] = struct{}{}
 	service.demand = false

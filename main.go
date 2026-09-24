@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -280,31 +282,485 @@ func parsePermissions(value string) (uint64, error) {
 }
 
 type App struct {
-	Identity       Identity          `yaml:",inline"`
-	Name           string            `yaml:"name"`
-	Requires       []string          `yaml:"requires"`
-	Startup        bool              `yaml:"startup"`
-	Ready          string            `yaml:"ready"`
-	Command        []string          `yaml:"command"`
-	Directory      string            `yaml:"directory"`
-	Env            map[string]string `yaml:"env"`
-	Vars           map[string]string `yaml:"vars,omitempty"`
-	RestartOn      []RestartRule     `yaml:"restart_on,omitempty"`
-	SCM            *SCMService       `yaml:"scm,omitempty"`
-	Listen         Socket            `yaml:"listen"`
-	SocketHandoff  string            `yaml:"socket_handoff,omitempty"`
-	SocketMode     *Permissions      `yaml:"socket_mode"`
-	MinWorkers     int               `yaml:"min_workers"`
-	MaxWorkers     int               `yaml:"max_workers"`
-	Concurrency    int               `yaml:"concurrency"`
-	IdleTimeout    time.Duration     `yaml:"idle_timeout"`
-	StartTimeout   time.Duration     `yaml:"start_timeout"`
-	StopTimeout    time.Duration     `yaml:"stop_timeout"`
-	RequestTimeout time.Duration     `yaml:"request_timeout"`
-	ScaleAt        Percent           `yaml:"scale_at,omitempty"`
-	ScaleWindow    time.Duration     `yaml:"scale_window,omitempty"`
-	ScaleDelay     time.Duration     `yaml:"scale_delay,omitempty"` // Legacy spelling of scale_window.
-	Source         string            `yaml:"-"`
+	Identity       Identity             `yaml:",inline"`
+	Name           string               `yaml:"name"`
+	Requires       []string             `yaml:"requires"`
+	Dependencies   map[string]string    `yaml:"dependencies,omitempty"`
+	Actions        map[string]Action    `yaml:"actions,omitempty"`
+	Triggers       map[string][]Trigger `yaml:"triggers,omitempty"`
+	Values         map[string]any       `yaml:"-"`
+	Startup        bool                 `yaml:"startup"`
+	Ready          string               `yaml:"ready"`
+	Command        []string             `yaml:"command"`
+	Directory      string               `yaml:"directory"`
+	Env            map[string]string    `yaml:"env"`
+	Vars           map[string]string    `yaml:"vars,omitempty"`
+	RestartOn      []RestartRule        `yaml:"restart_on,omitempty"`
+	SCM            *SCMService          `yaml:"scm,omitempty"`
+	Listen         Socket               `yaml:"listen"`
+	SocketHandoff  string               `yaml:"socket_handoff,omitempty"`
+	SocketMode     *Permissions         `yaml:"socket_mode"`
+	MinWorkers     int                  `yaml:"min_workers"`
+	MaxWorkers     int                  `yaml:"max_workers"`
+	Concurrency    int                  `yaml:"concurrency"`
+	IdleTimeout    time.Duration        `yaml:"idle_timeout"`
+	StartTimeout   time.Duration        `yaml:"start_timeout"`
+	StopTimeout    time.Duration        `yaml:"stop_timeout"`
+	RequestTimeout time.Duration        `yaml:"request_timeout"`
+	ScaleAt        Percent              `yaml:"scale_at,omitempty"`
+	ScaleWindow    time.Duration        `yaml:"scale_window,omitempty"`
+	ScaleDelay     time.Duration        `yaml:"scale_delay,omitempty"` // Legacy spelling of scale_window.
+	Source         string               `yaml:"-"`
+}
+
+// Definitions describe execution; bindings describe when and how it affects a service.
+type Action struct {
+	Command   []string          `yaml:"command,omitempty"`
+	Env       map[string]string `yaml:"env,omitempty"`
+	Directory string            `yaml:"directory,omitempty"`
+	HTTP      *HTTPRequest      `yaml:"http,omitempty"`
+	TCP       *SocketCheck      `yaml:"tcp,omitempty"`
+	UDP       *SocketCheck      `yaml:"udp,omitempty"`
+	Expect    Expectation       `yaml:"expect,omitempty"`
+	Timeout   time.Duration     `yaml:"timeout,omitempty"`
+	Retries   int               `yaml:"retries,omitempty"`
+	Backoff   time.Duration     `yaml:"backoff,omitempty"`
+}
+
+func (app *App) UnmarshalYAML(data []byte) error {
+	type fields App
+	if err := yaml.Unmarshal(data, (*fields)(app)); err != nil {
+		return err
+	}
+	return yaml.Unmarshal(data, &app.Values)
+}
+
+type HTTPRequest struct {
+	URL        string            `yaml:"url"`
+	Method     string            `yaml:"method,omitempty"`
+	Headers    map[string]string `yaml:"headers,omitempty"`
+	Body       string            `yaml:"body,omitempty"`
+	UnixSocket string            `yaml:"unix_socket,omitempty"`
+}
+
+type SocketCheck struct {
+	Address string `yaml:"address"`
+	Send    string `yaml:"send,omitempty"`
+}
+
+type Expectation struct {
+	ExitCodes []int  `yaml:"exit_codes,omitempty"`
+	Status    []int  `yaml:"status,omitempty"`
+	Contains  string `yaml:"contains,omitempty"`
+	Regexp    string `yaml:"regexp,omitempty"`
+}
+
+type Trigger struct {
+	Action           string        `yaml:"action"`
+	Scope            string        `yaml:"scope,omitempty"`
+	Wait             *bool         `yaml:"wait,omitempty"`
+	Interval         time.Duration `yaml:"interval,omitempty"`
+	FailureThreshold int           `yaml:"failure_threshold,omitempty"`
+	OnFailure        string        `yaml:"on_failure,omitempty"`
+}
+
+func (binding Trigger) awaited() bool { return binding.Wait == nil || *binding.Wait }
+
+func (app App) dependencies() map[string]string {
+	result := make(map[string]string, len(app.Requires)+len(app.Dependencies))
+	for _, name := range app.Requires {
+		result[name] = "ready"
+	}
+	for name, condition := range app.Dependencies {
+		result[name] = condition
+	}
+	return result
+}
+
+func (app *App) validateActions() error {
+	for name, condition := range app.Dependencies {
+		if slices.Contains(app.Requires, name) {
+			return fmt.Errorf("dependency %q specified twice", name)
+		}
+		if condition != "started" && condition != "ready" && condition != "parallel" {
+			return fmt.Errorf("dependencies.%s must be started, ready or parallel", name)
+		}
+	}
+	values, err := app.templateValues(app.Listen.Address)
+	if err != nil {
+		return err
+	}
+	for name, action := range app.Actions {
+		kinds := 0
+		for _, present := range []bool{len(action.Command) > 0, action.HTTP != nil, action.TCP != nil, action.UDP != nil} {
+			if present {
+				kinds++
+			}
+		}
+		if name == "" || kinds != 1 {
+			return fmt.Errorf("action %q requires exactly one of command, http, tcp, udp", name)
+		}
+		if action.Timeout == 0 {
+			action.Timeout = 3 * time.Second
+		}
+		if action.Backoff == 0 {
+			action.Backoff = 100 * time.Millisecond
+		}
+		if action.Timeout <= 0 || action.Backoff < 0 || action.Retries < 0 || action.Retries > 100 {
+			return fmt.Errorf("action %q: positive timeout/backoff and 0..100 retries required", name)
+		}
+		if len(action.Command) == 0 && (len(action.Env) > 0 || action.Directory != "" || len(action.Expect.ExitCodes) > 0) {
+			return fmt.Errorf("action %q: env, directory and exit_codes require command", name)
+		}
+		if action.HTTP == nil && len(action.Expect.Status) > 0 {
+			return fmt.Errorf("action %q: status requires http", name)
+		}
+		if action.UDP != nil && (action.UDP.Send == "" || (action.Expect.Contains == "" && action.Expect.Regexp == "")) {
+			return fmt.Errorf("action %q: UDP requires send and a response expectation", name)
+		}
+		for key := range action.Env {
+			if key == "" || strings.ContainsAny(key, "=\x00") {
+				return fmt.Errorf("action %q: invalid environment key", name)
+			}
+		}
+		expanded, err := action.expand(values)
+		if err != nil {
+			return fmt.Errorf("action %q: %w", name, err)
+		}
+		if expanded.Expect.Regexp != "" {
+			if _, err := regexp.Compile(expanded.Expect.Regexp); err != nil {
+				return fmt.Errorf("action %q: invalid response regexp", name)
+			}
+		}
+		if expanded.HTTP != nil {
+			request, err := http.NewRequest(expanded.HTTP.Method, expanded.HTTP.URL, nil)
+			if err != nil || (request.URL.Scheme != "http" && request.URL.Scheme != "https") || request.URL.Host == "" {
+				return fmt.Errorf("action %q: invalid HTTP request", name)
+			}
+		}
+		for _, check := range []*SocketCheck{expanded.TCP, expanded.UDP} {
+			if check != nil {
+				if _, _, err := net.SplitHostPort(check.Address); err != nil {
+					return fmt.Errorf("action %q: TCP/UDP requires host:port", name)
+				}
+			}
+		}
+		for _, status := range action.Expect.Status {
+			if status < 100 || status > 599 {
+				return fmt.Errorf("action %q: invalid HTTP status", name)
+			}
+		}
+		app.Actions[name] = action
+	}
+	for event, bindings := range app.Triggers {
+		if !slices.Contains([]string{"pre_start", "post_start", "pre_stop", "post_stop", "readiness", "health"}, event) {
+			return fmt.Errorf("unknown action trigger %q", event)
+		}
+		for index := range bindings {
+			binding := &bindings[index]
+			if _, ok := app.Actions[binding.Action]; !ok {
+				return fmt.Errorf("trigger %s: unknown action %q", event, binding.Action)
+			}
+			if binding.Scope == "" {
+				binding.Scope = "worker"
+			}
+			if binding.Scope != "worker" && binding.Scope != "app" {
+				return fmt.Errorf("trigger %s: scope must be worker or app", event)
+			}
+			periodic := event == "health" || event == "readiness"
+			if binding.Interval == 0 && periodic {
+				binding.Interval = time.Second
+			}
+			if binding.FailureThreshold == 0 {
+				binding.FailureThreshold = 1
+				if periodic {
+					binding.FailureThreshold = 3
+				}
+			}
+			if binding.Interval < 0 || (!periodic && binding.Interval != 0) || binding.FailureThreshold < 1 || (!periodic && binding.FailureThreshold != 1) {
+				return fmt.Errorf("trigger %s: interval/failure_threshold apply to readiness and health", event)
+			}
+			if binding.OnFailure == "" {
+				binding.OnFailure = "restart"
+				if !binding.awaited() || event == "pre_stop" || event == "post_stop" {
+					binding.OnFailure = "log"
+				}
+			}
+			if binding.OnFailure != "log" && binding.OnFailure != "restart" {
+				return fmt.Errorf("trigger %s: on_failure must be log or restart", event)
+			}
+			if binding.OnFailure == "restart" && (!binding.awaited() || event == "pre_stop" || event == "post_stop") {
+				return fmt.Errorf("trigger %s: restart requires wait and a start/readiness/health trigger", event)
+			}
+		}
+		app.Triggers[event] = bindings
+	}
+	return nil
+}
+
+// Expand every string leaf in an action with the same evaluator as command/env.
+func expandFields(value reflect.Value, values map[string]any, field string) error {
+	switch value.Kind() {
+	case reflect.String:
+		expanded, err := expandValue(values, field, value.String())
+		if err != nil {
+			return err
+		}
+		value.SetString(expanded)
+	case reflect.Struct:
+		for index := 0; index < value.NumField(); index++ {
+			if err := expandFields(value.Field(index), values, field+"."+value.Type().Field(index).Name); err != nil {
+				return err
+			}
+		}
+	case reflect.Pointer:
+		if !value.IsNil() {
+			clone := reflect.New(value.Type().Elem())
+			clone.Elem().Set(value.Elem())
+			value.Set(clone)
+			return expandFields(value.Elem(), values, field)
+		}
+	case reflect.Slice:
+		clone := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		reflect.Copy(clone, value)
+		value.Set(clone)
+		for index := 0; index < value.Len(); index++ {
+			if err := expandFields(value.Index(index), values, fmt.Sprintf("%s[%d]", field, index)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		clone := reflect.MakeMap(value.Type())
+		for _, key := range value.MapKeys() {
+			expandedKey := reflect.New(key.Type()).Elem()
+			expandedKey.Set(key)
+			if err := expandFields(expandedKey, values, field+" key"); err != nil {
+				return err
+			}
+			item := reflect.New(value.Type().Elem()).Elem()
+			item.Set(value.MapIndex(key))
+			if err := expandFields(item, values, field+" value"); err != nil {
+				return err
+			}
+			if clone.MapIndex(expandedKey).IsValid() {
+				return fmt.Errorf("duplicate expanded key in %s", field)
+			}
+			clone.SetMapIndex(expandedKey, item)
+		}
+		value.Set(clone)
+	}
+	return nil
+}
+
+func (action Action) expand(values map[string]any) (Action, error) {
+	err := expandFields(reflect.ValueOf(&action).Elem(), values, "action")
+	return action, err
+}
+
+const actionOutputLimit = 1 << 20
+
+type actionOutput struct {
+	data     []byte
+	overflow bool
+}
+
+func (output *actionOutput) Write(data []byte) (int, error) {
+	count := min(len(data), actionOutputLimit-len(output.data))
+	output.data = append(output.data, data[:count]...)
+	output.overflow = output.overflow || count < len(data)
+	return len(data), nil
+}
+
+func (expect Expectation) matches(data []byte) bool {
+	if !strings.Contains(string(data), expect.Contains) {
+		return false
+	}
+	if expect.Regexp == "" {
+		return true
+	}
+	matched, err := regexp.Match(expect.Regexp, data)
+	return err == nil && matched
+}
+
+func (action Action) attempt(ctx context.Context, owner *processOwner, app App, values map[string]any) error {
+	if len(action.Command) > 0 {
+		cmd := exec.Command(action.Command[0], action.Command[1:]...)
+		cmd.Dir = app.Directory
+		if action.Directory != "" {
+			cmd.Dir = resolve(app.Directory, action.Directory)
+		}
+		if strings.ContainsAny(action.Command[0], `/\`) {
+			cmd.Path = resolve(cmd.Dir, action.Command[0])
+		}
+		_, environment, err := app.expandCommand(values)
+		if err != nil {
+			return err
+		}
+		cmd.Env = os.Environ()
+		for key, value := range environment {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+		for key, value := range action.Env {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+		var output actionOutput
+		cmd.Stdout = &output
+		cmd.Stderr = io.Discard
+		cmd.WaitDelay = 100 * time.Millisecond
+		cmd.NewProcessGroup = true
+		release, err := app.Identity.apply(cmd)
+		if err != nil {
+			return fmt.Errorf("action identity unavailable")
+		}
+		defer release()
+		job, err := owner.Start(cmd)
+		if err != nil {
+			return fmt.Errorf("action command could not start")
+		}
+		finished := make(chan error, 1)
+		go func() { finished <- owner.Wait(job) }()
+		select {
+		case err = <-finished:
+		case <-ctx.Done():
+			job.Kill()
+			<-finished
+			err = ctx.Err()
+		}
+		if cleanupErr := job.Close(); cleanupErr != nil {
+			return fmt.Errorf("action family cleanup: %w", cleanupErr)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var exit *exec.ExitError
+		if err != nil && !errors.As(err, &exit) {
+			return fmt.Errorf("action command did not complete")
+		}
+		codes := action.Expect.ExitCodes
+		if len(codes) == 0 {
+			codes = []int{0}
+		}
+		if !slices.Contains(codes, job.cmd.ProcessState.ExitCode()) {
+			return fmt.Errorf("unexpected command exit code %d", job.cmd.ProcessState.ExitCode())
+		}
+		if output.overflow {
+			return fmt.Errorf("action output exceeds 1 MiB")
+		}
+		if !action.Expect.matches(output.data) {
+			return fmt.Errorf("stdout expectation failed")
+		}
+		return nil
+	}
+	if action.HTTP != nil {
+		check := action.HTTP
+		request, err := http.NewRequestWithContext(ctx, check.Method, check.URL, strings.NewReader(check.Body))
+		if err != nil {
+			return fmt.Errorf("invalid HTTP request")
+		}
+		for name, value := range check.Headers {
+			if strings.EqualFold(name, "Host") {
+				request.Host = value
+			} else {
+				request.Header.Set(name, value)
+			}
+		}
+		transport := &http.Transport{DisableKeepAlives: true}
+		defer transport.CloseIdleConnections()
+		if check.UnixSocket != "" {
+			transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", check.UnixSocket)
+			}
+		}
+		client := http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		response, err := client.Do(request)
+		if err != nil {
+			return fmt.Errorf("HTTP request failed")
+		}
+		defer response.Body.Close()
+		if len(action.Expect.Status) > 0 {
+			if !slices.Contains(action.Expect.Status, response.StatusCode) {
+				return fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
+			}
+		} else if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(response.Body, actionOutputLimit+1))
+		if err != nil {
+			return fmt.Errorf("HTTP response read failed")
+		}
+		if len(data) > actionOutputLimit {
+			return fmt.Errorf("action response exceeds 1 MiB")
+		}
+		if !action.Expect.matches(data) {
+			return fmt.Errorf("HTTP body expectation failed")
+		}
+		return nil
+	}
+	check, network := action.TCP, "tcp"
+	if action.UDP != nil {
+		check, network = action.UDP, "udp"
+	}
+	connection, err := (&net.Dialer{}).DialContext(ctx, network, check.Address)
+	if err != nil {
+		return fmt.Errorf("%s connection failed", network)
+	}
+	defer connection.Close()
+	deadline, _ := ctx.Deadline()
+	connection.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { connection.Close() })
+	defer stop()
+	if check.Send != "" {
+		if _, err := io.WriteString(connection, check.Send); err != nil {
+			return fmt.Errorf("%s send failed", network)
+		}
+	}
+	if action.Expect.Contains == "" && action.Expect.Regexp == "" {
+		return nil
+	}
+	var data []byte
+	buffer := make([]byte, 65536)
+	for len(data) <= actionOutputLimit {
+		count, err := connection.Read(buffer)
+		data = append(data, buffer[:count]...)
+		if len(data) > actionOutputLimit {
+			break
+		}
+		if action.Expect.matches(data) {
+			return nil
+		}
+		if err != nil || network == "udp" {
+			return fmt.Errorf("%s response expectation failed", network)
+		}
+	}
+	return fmt.Errorf("action response exceeds 1 MiB")
+}
+
+func (action Action) execute(ctx context.Context, owner *processOwner, app App, values map[string]any) error {
+	expanded, err := action.expand(values)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt <= action.Retries; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		trial, cancel := context.WithTimeout(ctx, action.Timeout)
+		err = expanded.attempt(trial, owner, app, values)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if attempt < action.Retries {
+			timer := time.NewTimer(min(min(action.Backoff, 30*time.Second)*time.Duration(1<<min(attempt, 10)), 30*time.Second))
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
+	}
+	return err
 }
 
 type SCMService struct {
@@ -429,6 +885,9 @@ func Load(path string) (Snapshot, error) {
 			if _, _, err := app.expandLaunch(app.Listen.Address); err != nil {
 				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
 			}
+			if err := app.validateActions(); err != nil {
+				return Snapshot{}, fmt.Errorf("%s: %w", file, err)
+			}
 			if app.SCM != nil {
 				name := strings.ToLower(app.SCM.Name)
 				if previous, ok := scmServices[name]; ok {
@@ -500,7 +959,7 @@ func validateDependencies(apps map[string]App) error {
 			return nil
 		}
 		state[name] = 1
-		for _, dependency := range app.Requires {
+		for dependency := range app.dependencies() {
 			if err := visit(dependency); err != nil {
 				return err
 			}
@@ -684,12 +1143,31 @@ func watchRoot(pattern string) (string, error) {
 // Expand each argument/value independently: no shell, word splitting or recursive
 // environment expansion. Keep the stored configuration unchanged for reloads.
 func (app App) expandLaunch(address string) ([]string, map[string]string, error) {
+	values, err := app.templateValues(address)
+	if err != nil {
+		return nil, nil, err
+	}
+	return app.expandCommand(values)
+}
+
+func (app App) templateValues(address string) (map[string]any, error) {
 	environment := make(map[string]string)
 	for _, entry := range os.Environ() {
 		key, value, _ := strings.Cut(entry, "=")
 		environment[key] = value
 	}
-	values := map[string]any{"name": app.Name, "directory": app.Directory, "source": app.Source, "env": environment, "vars": app.Vars}
+	config := app.Values
+	if config == nil {
+		data, err := yaml.Marshal(app)
+		if err != nil {
+			return nil, err
+		}
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			return nil, err
+		}
+	}
+	values := map[string]any{"name": app.Name, "directory": app.Directory, "source": app.Source, "env": environment, "vars": app.Vars, "config": config,
+		"runtime": map[string]any{"pid": 0, "workers": 0, "ready_workers": 0, "stopping_workers": 0, "requests": 0, "worker_requests": 0, "ready": false, "telemetry": false, "stopping": false, "pids": []int{}, "exit_code": -1, "started_ns": int64(0), "uptime_ms": int64(0), "event": "", "scope": "worker"}}
 	if app.Listen.Network != "" {
 		endpoint := map[string]string{"network": app.Listen.Network, "address": address}
 		uri := url.URL{Scheme: "tcp", Host: address}
@@ -702,37 +1180,43 @@ func (app App) expandLaunch(address string) ([]string, map[string]string, error)
 		} else {
 			host, port, err := net.SplitHostPort(address)
 			if err != nil {
-				return nil, nil, fmt.Errorf("listen.address: %w", err)
+				return nil, fmt.Errorf("listen.address: %w", err)
 			}
 			endpoint["host"], endpoint["port"] = host, port
 		}
 		endpoint["url"] = uri.String()
 		values["listen"] = endpoint
 	}
-	expand := func(field, value string) (string, error) {
-		if !strings.Contains(value, "{{") {
-			return value, nil
-		}
-		compiled, err := template.New(field).Option("missingkey=error").Parse(value)
-		if err != nil {
-			return "", fmt.Errorf("invalid template in %s", field)
-		}
-		var result strings.Builder
-		if err := compiled.Execute(&result, values); err != nil {
-			return "", fmt.Errorf("cannot expand template in %s: check placeholder names and environment", field)
-		}
-		if strings.ContainsRune(result.String(), 0) {
-			return "", fmt.Errorf("NUL in expanded %s", field)
-		}
-		return result.String(), nil
+	return values, nil
+}
+
+// All launch and action interpolation goes through this one evaluator.
+func expandValue(values map[string]any, field, value string) (string, error) {
+	if !strings.Contains(value, "{{") {
+		return value, nil
 	}
+	compiled, err := template.New(field).Option("missingkey=error").Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid template in %s", field)
+	}
+	var result strings.Builder
+	if err := compiled.Execute(&result, values); err != nil {
+		return "", fmt.Errorf("cannot expand template in %s: check placeholder names and environment", field)
+	}
+	if strings.ContainsRune(result.String(), 0) {
+		return "", fmt.Errorf("NUL in expanded %s", field)
+	}
+	return result.String(), nil
+}
+
+func (app App) expandCommand(values map[string]any) ([]string, map[string]string, error) {
 	arguments, field := app.Command, "command"
 	if app.SCM != nil {
 		arguments, field = app.SCM.Args, "scm.args"
 	}
 	command := make([]string, len(arguments))
 	for index, argument := range arguments {
-		value, err := expand(fmt.Sprintf("%s[%d]", field, index), argument)
+		value, err := expandValue(values, fmt.Sprintf("%s[%d]", field, index), argument)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -746,7 +1230,7 @@ func (app App) expandLaunch(address string) ([]string, map[string]string, error)
 	}
 	childEnv := make(map[string]string, len(app.Env))
 	for key, value := range app.Env {
-		expanded, err := expand("env."+key, value)
+		expanded, err := expandValue(values, "env."+key, value)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1043,7 +1527,293 @@ func (poller *Poller) Close() error {
 	return err
 }
 
+type appCycle struct {
+	members  map[*process]struct{}
+	scope    *actionScope
+	retiring bool
+}
+
+type actionScope struct {
+	config  App
+	address string
+	worker  *process
+	cycle   *appCycle
+	runs    map[string][]*actionRun
+}
+
+type actionRun struct {
+	scope                             *actionScope
+	event                             string
+	binding                           Trigger
+	running, done, success, cancelled bool
+	failures                          int
+	next                              time.Time
+	cancel                            context.CancelFunc
+}
+
+func (service *service) address() string {
+	if service.listener != nil {
+		return service.listener.Addr().String()
+	}
+	return service.config.Listen.Address
+}
+
+func (scope *actionScope) values(event string, now time.Time) (map[string]any, error) {
+	values, err := scope.config.templateValues(scope.address)
+	if err != nil {
+		return nil, err
+	}
+	state := values["runtime"].(map[string]any)
+	state["event"] = event
+	cycle := scope.cycle
+	if child := scope.worker; child != nil {
+		cycle = child.cycle
+		state["pid"], state["exit_code"] = child.pid, child.exitCode
+		state["worker_requests"], state["ready"], state["telemetry"], state["stopping"] = len(child.active), child.ready, child.telemetry, !child.stopping.IsZero()
+		if !child.pending {
+			state["started_ns"], state["uptime_ms"] = child.started.UnixNano(), now.Sub(child.started).Milliseconds()
+		}
+	} else {
+		state["scope"] = "app"
+	}
+	if cycle != nil {
+		workers, ready, stopping, requests := 0, 0, 0, 0
+		var pids []int
+		for child := range cycle.members {
+			if child.exited {
+				continue
+			}
+			if !child.stopping.IsZero() {
+				stopping++
+			} else {
+				workers++
+			}
+			if child.ready && child.stopping.IsZero() {
+				ready++
+			}
+			requests += len(child.active)
+			if child.pid > 0 {
+				pids = append(pids, child.pid)
+			}
+		}
+		slices.Sort(pids)
+		state["workers"], state["ready_workers"], state["stopping_workers"], state["requests"], state["pids"] = workers, ready, stopping, requests, pids
+	}
+	return values, nil
+}
+
+func (scope *actionScope) cancelChecks() {
+	if scope == nil {
+		return
+	}
+	for event, runs := range scope.runs {
+		if event == "pre_stop" || event == "post_stop" {
+			continue
+		}
+		for _, run := range runs {
+			run.cancelled = true
+			if run.cancel != nil {
+				run.cancel()
+			}
+		}
+	}
+}
+
+func (scope *actionScope) cancelPhase(event string) {
+	if scope == nil {
+		return
+	}
+	for _, run := range scope.runs[event] {
+		run.cancelled = true
+		if run.cancel != nil {
+			run.cancel()
+		}
+	}
+}
+
+// Called only from the manager goroutine. Execution happens off-loop and
+// returns an immutable result; it never mutates a process or configuration.
+func (manager *manager) phase(scope *actionScope, event string, now time.Time) bool {
+	if scope == nil {
+		return true
+	}
+	runs, exists := scope.runs[event]
+	if !exists {
+		kind := "app"
+		if scope.worker != nil {
+			kind = "worker"
+		}
+		for _, binding := range scope.config.Triggers[event] {
+			if binding.Scope == kind {
+				runs = append(runs, &actionRun{scope: scope, event: event, binding: binding})
+			}
+		}
+		scope.runs[event] = runs
+	}
+	ok := true
+	for _, run := range runs {
+		if !run.running && !run.cancelled && !now.Before(run.next) && (!run.done || event == "health" || (event == "readiness" && !run.success)) {
+			values, err := scope.values(event, now)
+			run.running = true
+			ctx, cancel := context.WithCancel(context.Background())
+			run.cancel = cancel
+			manager.actionTasks++
+			go func() {
+				defer cancel()
+				result := err
+				if result == nil {
+					result = scope.config.Actions[run.binding.Action].execute(ctx, manager.owner, scope.config, values)
+				}
+				manager.messages <- message{action: run, err: result}
+			}()
+		}
+		if run.binding.awaited() {
+			passed := run.done && run.success
+			if event == "health" {
+				passed = run.failures < run.binding.FailureThreshold
+			}
+			if event != "readiness" && event != "health" && run.done && run.binding.OnFailure == "log" {
+				passed = true
+			}
+			ok = ok && passed
+		}
+	}
+	return ok
+}
+
+func (manager *manager) actionResult(run *actionRun, err error, now time.Time) {
+	manager.actionTasks--
+	run.running = false
+	run.cancel = nil
+	if run.cancelled {
+		return
+	}
+	run.done, run.success = true, err == nil
+	run.next = now.Add(run.binding.Interval)
+	if err == nil {
+		run.failures = 0
+	} else {
+		run.failures++
+	}
+	manager.log.Debug("action completed", "app", run.scope.config.Name, "event", run.event, "action", run.binding.Action, "scope", run.binding.Scope, "success", err == nil)
+	if err == nil {
+		return
+	}
+	manager.log.Warn("action failed", "app", run.scope.config.Name, "event", run.event, "action", run.binding.Action, "failures", run.failures, "error", err)
+	if !run.binding.awaited() || run.binding.OnFailure != "restart" || run.failures < run.binding.FailureThreshold {
+		return
+	}
+	stop := func(child *process) {
+		if child.stopping.IsZero() && !child.exited {
+			child.failed = true
+			manager.stop(child, now, "action failed: "+run.binding.Action)
+		}
+	}
+	if run.scope.worker != nil {
+		stop(run.scope.worker)
+	} else {
+		for child := range run.scope.cycle.members {
+			stop(child)
+		}
+	}
+}
+
+func (manager *manager) lifecycle(child *process, now time.Time) {
+	cycle := child.cycle
+	if cycle == nil {
+		return
+	} // Tests may construct a process without action state.
+	if child.exited {
+		child.scope.cancelPhase("pre_stop")
+		workerDone := manager.phase(child.scope, "post_stop", now)
+		allExited := true
+		for other := range cycle.members {
+			allExited = allExited && other.exited
+		}
+		appDone := true
+		if allExited {
+			cycle.scope.cancelPhase("pre_stop")
+			appDone = manager.phase(cycle.scope, "post_stop", now)
+		}
+		if workerDone && appDone {
+			delete(manager.workers, child)
+			delete(child.service.workers, child)
+			delete(cycle.members, child)
+		}
+		return
+	}
+	if !child.stopping.IsZero() {
+		workerDone := manager.phase(child.scope, "pre_stop", now)
+		appDone := true
+		if cycle.retiring {
+			appDone = manager.phase(cycle.scope, "pre_stop", now)
+		}
+		if !child.stopSent && (workerDone && appDone || now.Sub(child.stopping) >= child.config.StopTimeout) {
+			child.stopSent = true
+			if child.pending {
+				child.exited = true
+			} else {
+				manager.signalStop(child, now)
+			}
+		}
+		return
+	}
+	if child.pending {
+		return
+	}
+	if child.scm != nil && !child.baseReady {
+		return
+	}
+	postWorker := manager.phase(child.scope, "post_start", now)
+	postApp := manager.phase(cycle.scope, "post_start", now)
+	child.ready = false
+	if !child.baseReady || !postWorker || !postApp {
+		return
+	}
+	readyWorker := manager.phase(child.scope, "readiness", now)
+	readyApp := manager.phase(cycle.scope, "readiness", now)
+	if !readyWorker || !readyApp {
+		return
+	}
+	healthWorker := manager.phase(child.scope, "health", now)
+	healthApp := manager.phase(cycle.scope, "health", now)
+	child.ready = healthWorker && healthApp && manager.dependenciesReady(child.config, true)
+	child.wasReady = child.wasReady || child.ready
+}
+
+func (manager *manager) dependenciesReady(app App, readiness bool) bool {
+	for name, condition := range app.dependencies() {
+		if condition == "parallel" && !readiness {
+			continue
+		}
+		found := false
+		if dependency := manager.services[name]; dependency != nil {
+			for child := range dependency.workers {
+				if child.pending || child.exited || !child.stopping.IsZero() {
+					continue
+				}
+				if condition == "started" || child.ready {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 type process struct {
+	wasReady  bool
+	pending   bool
+	exited    bool
+	baseReady bool
+	stopSent  bool
+	exitCode  int
+	scope     *actionScope
+	cycle     *appCycle
 	pid       int
 	scm       serviceControl
 	cmd       *exec.Cmd
@@ -1069,6 +1839,7 @@ type serviceControl interface {
 }
 
 type message struct {
+	action     *actionRun
 	scm        bool
 	pid        int
 	process    *process
@@ -1085,8 +1856,40 @@ type message struct {
 }
 
 func (manager *manager) spawn(service *service, now time.Time) error {
+	cycle := service.cycle
+	if cycle == nil || cycle.retiring {
+		cycle = &appCycle{members: make(map[*process]struct{})}
+		cycle.scope = &actionScope{config: service.config, address: service.address(), cycle: cycle, runs: make(map[string][]*actionRun)}
+		service.cycle = cycle
+	}
+	child := &process{pending: true, exitCode: -1, service: service, config: service.config, cycle: cycle, started: now, active: make(map[string]time.Time)}
+	child.scope = &actionScope{config: child.config, address: service.address(), worker: child, runs: make(map[string][]*actionRun)}
+	cycle.members[child] = struct{}{}
+	manager.workers[child] = struct{}{}
+	service.workers[child] = struct{}{}
+	appOK := manager.phase(cycle.scope, "pre_start", now)
+	workerOK := manager.phase(child.scope, "pre_start", now)
+	if appOK && workerOK {
+		if err := manager.startProcess(child, now); err != nil {
+			child.scope.cancelChecks()
+			delete(manager.workers, child)
+			delete(service.workers, child)
+			delete(cycle.members, child)
+			if len(cycle.members) == 0 {
+				cycle.retiring = true
+				cycle.scope.cancelChecks()
+			}
+			return err
+		}
+		manager.lifecycle(child, now)
+	}
+	return nil
+}
+
+func (manager *manager) startProcess(child *process, now time.Time) error {
+	service := child.service
 	if service.config.SCM != nil {
-		return manager.spawnSCM(service, now)
+		return manager.spawnSCM(child, now)
 	}
 	var childFile *os.File
 	if service.listener != nil {
@@ -1098,11 +1901,11 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 		defer childFile.Close()
 	}
 	app := service.config
-	address := app.Listen.Address
-	if service.listener != nil {
-		address = service.listener.Addr().String()
+	values, err := child.scope.values("launch", now)
+	if err != nil {
+		return err
 	}
-	command, environment, err := app.expandLaunch(address)
+	command, environment, err := app.expandCommand(values)
 	if err != nil {
 		return err
 	}
@@ -1165,10 +1968,11 @@ func (manager *manager) spawn(service *service, now time.Time) error {
 	}
 	writer.Close()
 	cmd = job.cmd
-	child := &process{pid: cmd.Process.Pid, cmd: cmd, control: control, job: job, service: service, config: app, active: make(map[string]time.Time), started: now}
+	child.pid, child.cmd, child.control, child.job = cmd.Process.Pid, cmd, control, job
+	child.pending = false
 	control = nil
 	if app.Ready == "started" {
-		child.ready = true
+		child.baseReady = true
 		child.idleSince = now
 	}
 	manager.workers[child] = struct{}{}
@@ -1242,6 +2046,7 @@ func (listener *serviceListener) arm(operation int) error {
 }
 
 type service struct {
+	cycle         *appCycle
 	name          string
 	config        App
 	listener      *serviceListener
@@ -1297,6 +2102,7 @@ func (pressure *pressureWindow) evaluate(now time.Time, window time.Duration, th
 }
 
 type manager struct {
+	actionTasks    int
 	owner          *processOwner
 	cgroup         string
 	services       map[string]*service
@@ -1377,7 +2183,7 @@ func run(ctx context.Context, path string, logger *slog.Logger, ready func()) er
 			cancelWatch()
 			manager.shutdown()
 		}
-		if stopping && len(manager.workers) == 0 {
+		if stopping && len(manager.workers) == 0 && manager.actionTasks == 0 {
 			return result
 		}
 		select {
@@ -1604,12 +2410,34 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 		return
 	}
 	child.stopping = now
+	child.ready = false
+	child.scope.cancelChecks()
+	if child.cycle != nil {
+		retiring := true
+		for other := range child.cycle.members {
+			if other.stopping.IsZero() && !other.exited {
+				retiring = false
+			}
+		}
+		if retiring {
+			child.cycle.retiring = true
+			child.cycle.scope.cancelChecks()
+		}
+	}
 	if child.failed {
 		// Replacements can start before this process exits; throttle failures now.
 		child.service.demand = true
 		child.service.backoff(now)
 	}
 	manager.log.Info("worker stopping", "app", child.service.name, "pid", child.pid, "reason", reason)
+	if child.scope != nil {
+		manager.lifecycle(child, now)
+		return
+	}
+	manager.signalStop(child, now)
+}
+
+func (manager *manager) signalStop(child *process, now time.Time) {
 	if child.scm != nil {
 		child.scm.Stop()
 		return
@@ -1629,6 +2457,10 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 }
 
 func (manager *manager) handle(msg message, now time.Time) {
+	if msg.action != nil {
+		manager.actionResult(msg.action, msg.err, now)
+		return
+	}
 	if msg.poll {
 		if msg.err != nil {
 			manager.fatal = fmt.Errorf("listener poller: %w", msg.err)
@@ -1657,7 +2489,11 @@ func (manager *manager) handle(msg message, now time.Time) {
 	defer service.observePressure(now)
 	if msg.scm {
 		child.pid = msg.pid
-		child.ready = msg.ready
+		child.baseReady = msg.ready
+		if child.cycle == nil {
+			child.ready = msg.ready
+		}
+		manager.lifecycle(child, now)
 		child.idleSince = now
 		manager.log.Info("SCM service status", "app", service.name, "pid", msg.pid, "ready", msg.ready)
 		return
@@ -1666,12 +2502,32 @@ func (manager *manager) handle(msg message, now time.Time) {
 		if msg.cleanupErr != nil {
 			manager.fatal = fmt.Errorf("clean up worker %d: %w", child.pid, msg.cleanupErr)
 		}
-		delete(manager.workers, child)
-		delete(service.workers, child)
+		child.exited = true
+		child.ready = false
+		child.scope.cancelChecks()
+		if child.cmd != nil && child.cmd.ProcessState != nil {
+			child.exitCode = child.cmd.ProcessState.ExitCode()
+		}
 		manager.log.Info("worker exited", "app", service.name, "pid", child.pid, "error", msg.err)
 		if child.stopping.IsZero() {
 			service.demand = true
 			service.backoff(now)
+		}
+		if child.cycle != nil {
+			active := false
+			for other := range child.cycle.members {
+				if !other.exited && other.stopping.IsZero() {
+					active = true
+				}
+			}
+			if !active {
+				child.cycle.retiring = true
+				child.cycle.scope.cancelChecks()
+			}
+			manager.lifecycle(child, now)
+		} else {
+			delete(manager.workers, child)
+			delete(service.workers, child)
 		}
 		return
 	}
@@ -1679,7 +2535,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		child.probing = false
 		child.nextProbe = now.Add(100 * time.Millisecond)
 		if msg.ready {
-			child.ready = true
+			child.baseReady = true
 			child.idleSince = now
 		}
 		return
@@ -1688,7 +2544,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 		child.telemetry = msg.ready
 		if msg.ready {
 			if child.config.Ready == "event" {
-				child.ready = true
+				child.baseReady = true
 			}
 			child.idleSince = now
 		} else if child.config.Ready == "event" {
@@ -1755,8 +2611,12 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 	}
 	for child := range manager.workers {
 		app := child.config
+		manager.lifecycle(child, now)
+		if child.exited {
+			continue
+		}
 		if !child.stopping.IsZero() {
-			if !child.killed && now.Sub(child.stopping) >= app.StopTimeout {
+			if !child.pending && !child.killed && now.Sub(child.stopping) >= app.StopTimeout {
 				child.killed = true
 				manager.log.Warn("worker exceeded graceful timeout", "pid", child.pid)
 				var err error
@@ -1771,11 +2631,11 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			}
 			continue
 		}
-		if !child.ready && now.Sub(child.started) >= app.StartTimeout {
+		if !child.wasReady && !child.ready && now.Sub(child.started) >= app.StartTimeout {
 			child.failed = true
 			manager.stop(child, now, "startup timeout")
 		}
-		if child.scm == nil && !child.ready && app.Ready != "event" && !child.probing && !now.Before(child.nextProbe) && child.stopping.IsZero() {
+		if !child.pending && child.scm == nil && !child.baseReady && app.Ready != "event" && app.Ready != "started" && !child.probing && !now.Before(child.nextProbe) && child.stopping.IsZero() {
 			child.probing = true
 			go func() {
 				network, address, _ := strings.Cut(app.Ready, "://")
@@ -1805,7 +2665,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		for child := range manager.workers {
 			required := false
 			for dependent := range manager.workers {
-				if slices.Contains(dependent.config.Requires, child.service.name) {
+				if _, depends := dependent.config.dependencies()[child.service.name]; depends {
 					required = true
 					break
 				}
@@ -1839,7 +2699,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			return
 		}
 		wanted[name] = true
-		for _, dependency := range current.config.Requires {
+		for dependency := range current.config.dependencies() {
 			required[dependency] = true
 			activate(dependency)
 		}
@@ -1851,20 +2711,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 	}
 	for _, service := range manager.services {
 		app := service.config
-		dependenciesReady := true
-		for _, name := range app.Requires {
-			dependency := manager.services[name]
-			ready := false
-			if dependency != nil {
-				for child := range dependency.workers {
-					if child.ready && child.stopping.IsZero() {
-						ready = true
-					}
-				}
-			}
-			dependenciesReady = dependenciesReady && ready
-		}
-		if !dependenciesReady {
+		if !manager.dependenciesReady(app, false) {
 			if len(service.workers) > 0 {
 				service.demand = true
 			}
@@ -1873,11 +2720,27 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			}
 			continue
 		}
+		for child := range service.workers {
+			if !child.pending || !child.stopping.IsZero() || child.exited {
+				continue
+			}
+			appOK := manager.phase(child.cycle.scope, "pre_start", now)
+			workerOK := manager.phase(child.scope, "pre_start", now)
+			if appOK && workerOK {
+				if err := manager.startProcess(child, now); err != nil {
+					manager.log.Error("worker start failed", "app", service.name, "error", err)
+					child.failed = true
+					manager.stop(child, now, "start failed")
+				} else {
+					manager.lifecycle(child, now)
+				}
+			}
+		}
 		service.observePressure(now)
 		pressureGrowth := service.pressure.evaluate(now, app.ScaleWindow, app.ScaleAt)
 		available, starting := 0, 0
 		for child := range service.workers {
-			if !child.stopping.IsZero() {
+			if !child.stopping.IsZero() || child.exited {
 				continue
 			}
 			available++
@@ -1893,7 +2756,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		if app.SCM != nil && len(service.workers) != 0 {
 			grow = false // One SCM name is one instance, including while stopping.
 		}
-		if grow && starting == 0 && available < app.MaxWorkers && !now.Before(service.retryAt) {
+		if grow && (starting == 0 || available < app.MinWorkers) && available < app.MaxWorkers && !now.Before(service.retryAt) {
 			if err := manager.spawn(service, now); err != nil {
 				service.backoff(now)
 				manager.log.Error("worker start failed", "app", service.name, "error", err)

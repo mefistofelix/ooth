@@ -23,6 +23,19 @@ func TestConfigExtraFields(t *testing.T) {
 	write(t, path, "watch: [app.yaml]\nresources: {max_cpu_percent: 85, vendor_limit: [1, 2]}\nmetadata: {project: demo}\n")
 	write(t, appPath, "name: web\ncommand: [worker]\nlisten: {network: tcp, address: '127.0.0.1:12345', vendor: {enabled: true}}\nrestart_on: [{glob: '*.py', description: sources}]\nframework: {routes: [home, admin]}\n")
 	got, err := Load(path)
+	if err == nil {
+		if got.Apps["web"].Values["framework"] == nil {
+			t.Fatal("extra fields missing from template configuration")
+		}
+		for name, app := range got.Apps {
+			app.Values = nil
+			got.Apps[name] = app
+		}
+		for name, app := range want.Apps {
+			app.Values = nil
+			want.Apps[name] = app
+		}
+	}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("extra fields changed configuration: %v\n%+v", err, got)
 	}

@@ -117,12 +117,174 @@ Expansion errors name the affected field without printing its value.
 | `{{.listen.network}}`, `{{.listen.address}}`, `{{.listen.url}}` | Inherited listener metadata, available only with `listen`. URLs use `tcp://` or `unix://` and escape paths. |
 | `{{.listen.host}}`, `{{.listen.port}}` | TCP listener host and port, including the actual assigned port when binding port zero. |
 | `{{.listen.path}}` | Resolved Unix socket path. |
+| `{{.config.custom.key}}` | The original application YAML, including extra fields belonging to other tools. Use `index .config "key-with-dashes"` for such keys. |
+| `{{.runtime.pid}}` | The instance PID; zero before spawn and for app-scoped actions. |
+| `{{.runtime.workers}}`, `{{.runtime.ready_workers}}`, `{{.runtime.stopping_workers}}`, `{{.runtime.pids}}` | Snapshot of the current app lifecycle generation; workers includes reserved starts and excludes retirees/exited instances. |
+| `{{.runtime.requests}}`, `{{.runtime.worker_requests}}` | In-flight requests reported by the generation and by this instance. |
+| `{{.runtime.ready}}`, `{{.runtime.telemetry}}`, `{{.runtime.stopping}}` | Instance state; false where no instance exists. |
+| `{{.runtime.started_ns}}`, `{{.runtime.uptime_ms}}` | Startup timestamp and elapsed startup time; zero before spawning or for app scope. |
+| `{{.runtime.exit_code}}` | Direct process exit code in `post_stop`, otherwise -1; SCM does not expose a POSIX-style exit code here. |
+| `{{.runtime.event}}`, `{{.runtime.scope}}` | `launch` or the action trigger name; `worker` or `app`. |
 
-Only `command` and `env` values are expanded; `vars`, `directory`, `ready` and
-`listen` remain literal configuration. Validation uses the configured address;
-spawn uses the bound listener's actual address. Quote expressions in YAML.
+The same evaluator expands `scm.args` and every string parameter of an action:
+arguments, environment keys/values, action directory, HTTP URL/method/headers/body,
+Unix transport path, TCP/UDP address/payload and expected text/regexp. Timing,
+numeric expectations and trigger policy remain typed YAML fields. `vars`, the
+app-level `directory`, `ready`, and `listen` remain literal configuration.
+`.config` is the source document, not an expanded copy and not a map of defaults.
+Changing an extra field now reloads the app too, since a template may use it.
+Validation uses the configured address and zero-valued runtime data; execution
+uses the bound listener's actual address and a fresh immutable state snapshot.
+One invocation's retries share that snapshot; the next periodic invocation gets
+a new one. Runtime values are unavailable before their event, not predictions
+of the future PID or pool. A listener handle is process-local and is not exposed
+to actions as an inheritable capability. Quote expressions in YAML.
 For example, an argument `"--endpoint={{.vars.endpoint}}"` and environment value
 `ENDPOINT: "{{.vars.endpoint}}"` receive the same string.
+
+### Actions, lifecycle hooks and health checks
+
+Define named `actions` inside an **application YAML**, then attach them separately
+under `triggers`. Definitions describe execution and matching; a binding chooses
+the event, `scope: worker|app`, whether to `wait`, and failure policy. No shell,
+CGO, extra dependency or Go patch is involved. CEL is deferred.
+
+```yaml
+name: api
+command: [my-server]
+min_workers: 1
+start_timeout: 45s
+vars:
+  health_url: http://127.0.0.1:8080/health
+actions:
+  healthy:
+    http:
+      url: '{{.vars.health_url}}'
+      method: GET
+      headers: {X-Probe: '{{.name}}'}
+    expect:
+      status: [200]
+      contains: ready
+      regexp: 'ready|healthy'
+    timeout: 2s
+    retries: 2
+    backoff: 100ms
+  prepare:
+    command: [my-tool, prepare, '--app={{.name}}']
+    env: {APP_SOURCE: '{{.source}}'}
+    expect: {exit_codes: [0], contains: prepared}
+  report:
+    command: [my-tool, record, '{{.runtime.event}}', '{{.runtime.pid}}']
+triggers:
+  pre_start:
+    - {action: prepare, scope: app, wait: true}
+  post_start:
+    - {action: report, scope: worker, wait: false}
+  readiness:
+    - {action: healthy, scope: app, interval: 1s, failure_threshold: 5}
+  health:
+    - {action: healthy, scope: app, interval: 10s, failure_threshold: 3, on_failure: restart}
+  pre_stop:
+    - {action: report, scope: worker, wait: false}
+  post_stop:
+    - {action: report, scope: app, wait: true}
+```
+
+Exactly one action kind is required:
+
+| Kind | Parameters and success |
+| --- | --- |
+| `command: [executable, args...]` | Direct execution in the app's account/directory/environment. Optional action `directory` (relative to app directory) and `env` override those values. Exit zero by default, or one of `expect.exit_codes`; text matching inspects stdout. stderr is discarded and stdout never enters the worker telemetry parser. |
+| `http: {url, method, headers, body, unix_socket}` | GET by default; optional `unix_socket` connects HTTP through that Unix path instead of TCP. Status 2xx by default, or one of `expect.status`; text matching inspects the response body. Redirects are not followed. |
+| `tcp: {address, send}` | Connect to host:port. Optional `send` writes a payload. Without a text expectation the connection/write is sufficient; otherwise read until matching or timeout/EOF. |
+| `udp: {address, send}` | Send a datagram and validate the first reply. Both payload and a text expectation are required: a successful UDP send alone does not verify the peer. |
+
+`expect.contains` and `expect.regexp` are optional and, when both are present,
+both must match. Regexps use Go syntax. Network and execution errors fail the
+attempt before text matching. Output is bounded at 1 MiB; excess output fails.
+TCP matching may succeed on a received prefix without waiting for EOF.
+
+An action defaults to `timeout: 3s`, `retries: 0` and `backoff: 100ms`. Retries
+are **additional attempts**, each with its own timeout; delays double up to 30s.
+Command timeout/cancellation kills its owned Job/cgroup, with the usual Linux
+direct-child fallback when a cgroup is unavailable. The command is a finite
+action, not a way to launch an unsupervised daemon. Captured output and expanded
+parameters are not written to logs; logs identify action, event and failure.
+
+Bindings default to `scope: worker` and `wait: true`. Bindings within an event
+execute concurrently. Awaited bindings gate that phase; `wait: false` is a
+bounded background notification whose outcome only logs, without changing
+readiness or restarting anything. `on_failure: restart` is the default for
+awaited start/readiness/health bindings; `log` is the default for stop hooks
+and unawaited bindings. `restart` is rejected for stop hooks or `wait: false`.
+
+| Trigger | Meaning |
+| --- | --- |
+| `pre_start` | Before OS spawn. An awaited failure prevents spawn and applies restart backoff; `on_failure: log` permits it. Reserved starts count toward capacity. |
+| `post_start` | After spawn (SCM: after Running). Awaited hooks must complete before readiness; failure normally retires the instance. |
+| `readiness` | After the existing `ready` criterion and awaited post-start hooks. Repeats until first success; all awaited checks must pass. |
+| `health` | Starts after initial readiness checks pass, repeats at `interval`, with no overlapping invocation of the same binding. |
+| `pre_stop` | Before sending stdin/OS/SCM graceful stop. Awaited hooks consume the existing `stop_timeout`, never extend it. Failure logs and proceeds; deadline forces termination. |
+| `post_stop` | After process exit and family cleanup, also after a crash. Awaited hooks complete before shutdown considers that instance fully retired. |
+
+Readiness and health default to `interval: 1s` and `failure_threshold: 3`;
+the interval starts when the preceding invocation finishes. A failure means an
+entire invocation exhausted its action retries. Success resets consecutive
+failures. Readiness stays false until success and is still bounded by
+`start_timeout`. Health only marks the instance/app unready at the threshold;
+`restart` retires it, while `log` leaves it running and a subsequent success
+restores readiness. Unawaited checks do not affect these states. Startup and
+health actions are cancelled on retirement. Stop hooks have their own bounded
+action timeout; a pre-stop action is cancelled if its worker exits. ooth waits
+for outstanding action cleanup on shutdown, including background notifications.
+HTTP and socket checks send real traffic, which may reset idle timers or create
+telemetry load. Choose the interval accordingly for scale-to-zero applications.
+
+App scope runs once for an active generation, rather than once for each scaled
+worker: pre-start before its first spawn, post-start after its first spawn,
+pre-stop when its last active member is retired, and post-stop after its last
+member exits. Readiness/health results apply to all members of that generation;
+an app-scoped failure restarts all of them. Once every member is retiring, new
+demand/minimum may create a new generation while the old one drains. Thus old
+post-stop actions can overlap new pre-start actions; they use their original
+configuration and cannot change the new generation's state. Hooks must account
+for shared external resources. Scaling by itself does not repeat app hooks.
+
+A check against a shared listener proves that **some** worker answers, not which
+PID answered. Use app scope for that probe, or a worker-specific endpoint/command
+using `.runtime.pid` when individual readiness matters. A TCP connect to ooth's
+parent listener alone only proves the listening socket exists. Readiness gates
+supervision and dependencies; ooth does not intercept traffic or prevent an
+already accepting worker from receiving requests. Waiting pre-stop hooks delay
+the graceful request; use `wait: false` for a notification that must not delay it.
+
+### Dependency conditions
+
+`requires: [database]` retains its existing meaning: activate database and wait
+for readiness before starting this app. Alternatively specify conditions:
+
+```yaml
+dependencies:
+  database: ready
+  logger: started
+  cache: parallel
+```
+
+`started` waits for an existing non-retiring process, without its readiness;
+`ready` waits for full readiness including actions. `parallel` activates both
+apps concurrently but this app remains unready until that dependency is ready.
+All kinds hold the dependency alive, participate in cycle detection and reverse
+shutdown order. A name cannot occur in both `requires` and `dependencies`.
+Loss of a `started`/`ready` prerequisite retires dependent workers as before;
+loss of a `parallel` prerequisite removes readiness without stopping them.
+Configured minimum workers may start together even while readiness is pending.
+
+This separation draws on [Pebble health checks](https://ubuntu.com/docs/pebble/reference/health-checks/)
+while using app-local actions and explicit lifecycle/dependency readiness gates.
+The runnable [actions example](examples/actions/ooth.yaml) uses the existing
+Python worker on port 8081: run `ooth -config examples/actions-root.yaml`.
+`actions_test.go` preserves native Linux/Windows execution, protocol matching,
+retries, scope, dependency, cancellation, stop-deadline and recovery tests.
 
 ### Restart an app when files change
 
@@ -239,12 +401,12 @@ ready: tcp://127.0.0.1:5432
 
 The first demand for `web` activates `database` and `cache` together. `web` starts after both are ready. Shared prerequisites start once. This is an internal dependency graph, not an additional control socket.
 
-- `ready: started`: ready as soon as process creation succeeds; default for all services. This orders process creation, not application initialization, and works even with silent stdout.
+- `ready: started`: base readiness as soon as process creation succeeds; default for all services. Awaited post-start/readiness actions may delay effective readiness further. This orders process creation, not application initialization, and works even with silent stdout.
 - `ready: event`: explicitly require the first stdout line to be the `ready` handshake before releasing dependent services. A different first line fails this readiness requirement; silence reaches `start_timeout`.
 - `ready: tcp://host:port` or `unix://path`: connect to the endpoint until it responds. Probes establish and close a real connection, so use an endpoint that tolerates that.
 - `startup: true`: activate at supervisor startup and keep at least one worker.
 
-Virtual services default to `max_workers: 1`, but can use larger pools. They remain running while required. Without telemetry, retirement follows dependency demand; with telemetry, idle workers retire down to the configured minimum or the one process retained for a required dependency/startup service. Losing a prerequisite stops dependent workers; demand reactivates the dependency graph. Supervisor shutdown drains dependents before prerequisites. The scheduler does not require unrelated branches to wait for one another.
+Virtual services default to `max_workers: 1`, but can use larger pools. They remain running while required. Without telemetry, retirement follows dependency demand; with telemetry, idle workers retire down to the configured minimum or the one process retained for a required dependency/startup service. Losing a required readiness/started prerequisite stops dependent workers; `dependencies: {name: parallel}` only gates readiness. Demand reactivates the dependency graph. Supervisor shutdown drains dependents before prerequisites. The scheduler does not require unrelated branches to wait for one another.
 
 ### Programs that open their own listeners
 
@@ -446,7 +608,9 @@ command-line arguments. Command, environment, working directory and identity
 come from the SCM registration, so ooth rejects their per-app overrides here.
 Socket inheritance and stdout telemetry are unavailable through SCM.
 
-SCM running status supplies readiness. The normal `startup`, `min_workers`,
+SCM running status supplies base readiness; awaited post-start/readiness actions
+can gate it further. Action commands run as ooth, not the SCM service account.
+The normal `startup`, `min_workers`,
 dependencies, crash backoff and `restart_on` rules apply, with `max_workers: 1`.
 There is no request-based scaling or activation by a parent socket. The same
 SCM name cannot appear in two app definitions. A service already active at the
