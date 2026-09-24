@@ -1766,15 +1766,18 @@ func (manager *manager) lifecycle(child *process, now time.Time) {
 	}
 	postWorker := manager.phase(child.scope, "post_start", now)
 	postApp := manager.phase(cycle.scope, "post_start", now)
-	child.ready = false
 	if !child.baseReady || !postWorker || !postApp {
+		child.ready = false
 		return
 	}
 	readyWorker := manager.phase(child.scope, "readiness", now)
 	readyApp := manager.phase(cycle.scope, "readiness", now)
 	if !readyWorker || !readyApp {
+		child.ready = false
 		return
 	}
+	// Capture checks against the published state, then apply their new outcome.
+	// Clearing ready first would expose a false not-ready state to every probe.
 	healthWorker := manager.phase(child.scope, "health", now)
 	healthApp := manager.phase(cycle.scope, "health", now)
 	child.ready = healthWorker && healthApp && manager.dependenciesReady(child.config, true)

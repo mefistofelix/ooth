@@ -285,6 +285,9 @@ The runnable [actions example](examples/actions/ooth.yaml) uses the existing
 Python worker on port 8081: run `ooth -config examples/actions-root.yaml`.
 `actions_test.go` preserves native Linux/Windows execution, protocol matching,
 retries, scope, dependency, cancellation, stop-deadline and recovery tests.
+`actions_lifecycle_test.go` additionally checks readiness loss/recovery for all
+dependency conditions, reverse shutdown order while a dependent post-stop hook
+is pending, and non-overlapping periodic checks with the published runtime state.
 
 ### Restart an app when files change
 
