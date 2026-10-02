@@ -4,7 +4,7 @@ Minimal process supervisor with lazy socket activation, written in Go. The super
 
 ooth owns TCP or Unix listening sockets. Incoming connections wake a worker pool; each worker inherits an additional listener handle, reads its number from `OOTH_LISTEN_HANDLE`, and accepts connections itself. Legacy stdin handoff is configurable. **ooth never accepts, reads, copies, or proxies application traffic.** “Copyless” here means no forwarding through the supervisor, not that the operating system or application performs no copies.
 
-An app without `listen` runs as an ordinary process pool. The same minimum, maximum, telemetry, scaling and shutdown rules apply; the program can open its own listener. There is no special reuseport mode in ooth.
+An app without `listen` runs as an ordinary process pool. The same minimum, maximum, telemetry, scaling and shutdown rules apply; the program can open its own listener. There is no special reuseport mode in ooth. With `schedule`, an app instead runs its command periodically using cron or elapsed intervals, with non-overlapping executions by default and an optional execution-time limit.
 
 This is an experimental nucleus, not a replacement for all of systemd. It supervises foreground processes, orders dependencies, restarts failed workers with backoff, grows busy pools, and removes idle workers. Windows Jobs and Linux cgroup v2 keep descendants associated with their worker even when intermediate parents exit. Linux reaps adopted orphans both as PID 1 and, using subreaper mode, as an ordinary process. This is independent of cgroup availability. Optional Windows SCM integration lets ooth run as a service. It does not mount filesystems or configure the machine.
 
@@ -110,6 +110,76 @@ Linux also reads visible cgroup v2 ancestors of ooth and its worker delegation: 
 Listener notifications activate empty pools; they do not measure universal request pressure. Workers without the stdout handshake have no request-based scaling. Idle telemetry workers stop after `idle_timeout`, down to `min_workers`, including zero; required dependencies retain at least one. `request_timeout: 0s` disables the request watchdog.
 
 Configuration is validated as a whole before applying it. Invalid YAML, missing dependencies, and cycles retain the previous running configuration. New listeners are bound before changing existing services; a bind failure is retried. Updating a service gracefully retires its old workers and reuses an unchanged listener. Retiring workers no longer count toward active capacity or `max_workers`: replacements may start while they drain. Removing an app closes its parent listener and stops its workers. A removed or malformed app file that leaves unresolved dependencies causes the entire snapshot to be rejected.
+
+### Scheduled commands: cron and intervals
+
+Any app command can run on a schedule, on Linux and Windows:
+
+```yaml
+name: cleanup
+command: [python3, cleanup.py]
+schedule: "*/5 * * * *"  # Every five minutes; alternatively "10s" or "5m".
+overlap: false          # Default: skip occurrences while an execution is unfinished.
+max_exec_time: 2m       # Optional; zero/omitted means no execution-time limit.
+stop_timeout: 10s       # Graceful stop allowance before whole-family termination.
+```
+
+`schedule` accepts either a positive Go duration (`10s`, `5m`, `1h30m`) or a
+Linux-style five-field cron expression: **minute, hour, day of month, month,
+weekday**. Fields support `*`, lists, inclusive ascending ranges and steps on
+`*` or ranges, for example `*/15 9-17 * * MON-FRI`. Month and weekday names use
+three letters and ignore case; Sunday is `0` or `7`. When both day fields are
+restricted, either matching day is enough; when either begins with `*`, both
+must match. Supported aliases are `@hourly`, `@daily`/`@midnight`, `@weekly`,
+`@monthly` and `@yearly`/`@annually`. This is the time-field grammar described
+in [Cronie's crontab manual](https://github.com/cronie-crond/cronie/blob/master/man/crontab.5),
+not a complete crontab file: specify the command and identity in the ordinary
+app fields. Seconds fields, `@reboot`, random ranges and inline `TZ` directives
+are not supported.
+
+Cron uses the supervisor's local timezone on both platforms and checks each
+minute once. A daylight-saving gap has no matching occurrence; a repeated
+local time can run twice. Intervals start one interval after configuration is
+installed and retain that cadence, independent of command duration. The
+supervisor's existing 25 ms tick bounds scheduling precision. Missed occurrences
+while ooth is stopped or its event loop is delayed are not replayed. Reloading
+a changed app installs a new cadence; an unchanged app retains its schedule.
+
+By default, each app has at most one unfinished scheduled execution. Reservations
+waiting on pre-start hooks, draining processes and awaited post-stop hooks all
+count, including old executions retired by a configuration change. An occurrence
+at capacity is skipped, with a debug log; it is not queued for later. To permit
+concurrent runs, set `overlap: true` and `max_workers` above one. The default
+`max_workers: 1` still caps overlap at one. Each occurrence gets a new process
+and its own lifecycle generation, so app-scope and worker-scope hooks run for
+that invocation. Hooks configured with `wait: false` do not extend its completion
+gate. Identity, environment, placeholders, file watching and process-family
+cleanup use the ordinary app implementation.
+
+A scheduled app requires `startup: false`, `min_workers: 0` and no `listen`.
+Its clock activates normal service dependencies, honoring `started`, `ready`
+and `parallel` conditions. At most one occurrence waits for unavailable
+dependencies; further occurrences during that wait are skipped. Dependencies
+remain demanded while the job and its awaited cleanup are unfinished. A
+scheduled job cannot itself be a service dependency, since it does not promise
+continuous availability. Scheduled commands do not use request autoscaling,
+idle shrinking or the global optional-growth resource gate. Successful exits,
+failed exits, startup failures and timeouts all wait for the next occurrence;
+there is no immediate process restart or retry backlog.
+
+`max_exec_time` counts from successful process creation, excluding pre-start
+hooks. On expiry, ooth begins the normal graceful stop sequence; pre-stop hooks
+and draining must fit within `stop_timeout`, after which it kills the process
+family. The total bound is therefore execution limit plus graceful allowance,
+subject to scheduler/OS latency. `start_timeout` separately bounds startup and
+readiness. This execution limit is also available for ordinary unscheduled
+apps, which retain their normal restart policy. Shutdown prevents further
+scheduled starts and drains existing executions in dependency order.
+
+Run the minimal interval example with `-config examples/cron-root.yaml`; adjust
+its `python3` command to your interpreter. Native parser, calendar, interval,
+non-overlap, overlapping-run cap, readiness, hook, reload and timeout tests are
+saved in `test/schedule_test.go`.
 
 ### Arguments and environment placeholders
 

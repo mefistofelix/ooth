@@ -21,6 +21,12 @@ test files normally. Tests run with `src/` as their working directory; relative
 Go flags such as `-o` are also relative to `src/`. The temporary overlay file is
 removed after each invocation. The build script uses the same runner.
 
+Scheduled-command tests are in `schedule_test.go` and run in the default native
+suite. Select them with `-run '^TestSchedule'` for calendar/cron syntax, real
+interval execution, non-overlap, overlap caps, readiness dependencies, lifecycle
+hooks, reload/removal, failed exits/launches and graceful/forced execution limits.
+They use the test executable as a finite command and need no external runtime.
+
 The [integration fixtures](integration/README.md) contain workers, proxy
 configurations, runtime preparation scripts, research probes and saved aggregate
 results. Each suite documents its optional `OOTH_TEST_*` variables; executable

@@ -1,0 +1,10 @@
+# Run separately with examples/cron-root.yaml; set python3 to your interpreter.
+name: scheduled-job
+command: [python3, job.py]
+schedule: 10s
+# Alternatively: schedule: "*/5 * * * *"
+overlap: false
+max_exec_time: 5s
+stop_timeout: 2s
+env:
+  JOB_SECONDS: "2"

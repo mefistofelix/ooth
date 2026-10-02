@@ -306,6 +306,9 @@ type App struct {
 	Actions        map[string]Action    `yaml:"actions,omitempty"`
 	Triggers       map[string][]Trigger `yaml:"triggers,omitempty"`
 	Values         map[string]any       `yaml:"-"`
+	Schedule       string               `yaml:"schedule,omitempty"`
+	Overlap        bool                 `yaml:"overlap,omitempty"`
+	MaxExecTime    time.Duration        `yaml:"max_exec_time,omitempty"`
 	Startup        bool                 `yaml:"startup"`
 	Ready          string               `yaml:"ready"`
 	Command        []string             `yaml:"command"`
@@ -818,6 +821,171 @@ type Snapshot struct {
 	Resources ResourceLimits
 }
 
+// A schedule is either an elapsed interval or five calendar-field bit sets.
+type schedule struct {
+	interval time.Duration
+	fields   [5]uint64
+	wildDays [2]bool
+}
+
+func parseSchedule(expression string) (schedule, error) {
+	var plan schedule
+	if expression == "" {
+		return plan, nil
+	}
+	if interval, err := time.ParseDuration(expression); err == nil {
+		if interval <= 0 {
+			return plan, fmt.Errorf("interval must be positive")
+		}
+		plan.interval = interval
+		return plan, nil
+	}
+	aliases := map[string]string{
+		"@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *",
+		"@monthly": "0 0 1 * *", "@weekly": "0 0 * * 0",
+		"@daily": "0 0 * * *", "@midnight": "0 0 * * *", "@hourly": "0 * * * *",
+	}
+	if expanded, exists := aliases[expression]; exists {
+		expression = expanded
+	}
+	fields := strings.Fields(expression)
+	if len(fields) != 5 {
+		return plan, fmt.Errorf("use a positive duration or five cron fields: minute hour day month weekday")
+	}
+	limits := [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 7}}
+	for index, field := range fields {
+		var names []string
+		if index == 3 {
+			names = strings.Fields("jan feb mar apr may jun jul aug sep oct nov dec")
+		} else if index == 4 {
+			names = strings.Fields("sun mon tue wed thu fri sat")
+		}
+		mask, err := cronField(field, limits[index][0], limits[index][1], names)
+		if err != nil {
+			return plan, fmt.Errorf("cron field %d: %w", index+1, err)
+		}
+		plan.fields[index] = mask
+	}
+	// Cron treats a day field beginning with '*' (including steps) as a wildcard.
+	plan.wildDays = [2]bool{strings.HasPrefix(fields[2], "*"), strings.HasPrefix(fields[4], "*")}
+	return plan, nil
+}
+
+func cronField(field string, minimum, maximum int, names []string) (uint64, error) {
+	value := func(text string) (int, error) {
+		if index := slices.Index(names, strings.ToLower(text)); index >= 0 {
+			return minimum + index, nil
+		}
+		if text == "" || strings.Trim(text, "0123456789") != "" {
+			return 0, fmt.Errorf("invalid value %q", text)
+		}
+		number, err := strconv.Atoi(text)
+		if err != nil || number < minimum || number > maximum {
+			return 0, fmt.Errorf("value must be between %d and %d", minimum, maximum)
+		}
+		return number, nil
+	}
+	var mask uint64
+	for _, item := range strings.Split(field, ",") {
+		base, stepText, stepped := strings.Cut(item, "/")
+		step := 1
+		if stepped {
+			var err error
+			step, err = strconv.Atoi(stepText)
+			if err != nil || step <= 0 || strings.Trim(stepText, "0123456789") != "" {
+				return 0, fmt.Errorf("step must be a positive integer")
+			}
+		}
+		first, last := minimum, maximum
+		if base != "*" {
+			start, end, ranged := strings.Cut(base, "-")
+			var err error
+			first, err = value(start)
+			if err != nil {
+				return 0, err
+			}
+			last = first
+			if ranged {
+				last, err = value(end)
+				if err != nil {
+					return 0, err
+				}
+			} else if stepped {
+				return 0, fmt.Errorf("steps require '*' or a range")
+			}
+			if last < first {
+				return 0, fmt.Errorf("range must be ascending")
+			}
+		}
+		for number := first; number <= last; {
+			mask |= uint64(1) << number
+			if step > last-number {
+				break
+			}
+			number += step
+		}
+	}
+	return mask, nil
+}
+
+func (plan schedule) matches(now time.Time) bool {
+	values := [5]int{now.Minute(), now.Hour(), now.Day(), int(now.Month()), int(now.Weekday())}
+	var matched [5]bool
+	for index, value := range values {
+		matched[index] = plan.fields[index]&(uint64(1)<<value) != 0
+	}
+	if now.Weekday() == time.Sunday && plan.fields[4]&(1<<7) != 0 {
+		matched[4] = true
+	}
+	days := matched[2] && matched[4]
+	if !plan.wildDays[0] && !plan.wildDays[1] {
+		days = matched[2] || matched[4]
+	}
+	return matched[0] && matched[1] && matched[3] && days
+}
+
+func (plan schedule) next(now time.Time) time.Time {
+	if plan.interval > 0 {
+		return now.Add(plan.interval)
+	}
+	if plan.fields[0] != 0 {
+		return now.Truncate(time.Minute).Add(time.Minute)
+	}
+	return time.Time{}
+}
+
+func (manager *manager) scheduleDue(service *service, now time.Time) {
+	if service.nextRun.IsZero() || now.Before(service.nextRun) {
+		return
+	}
+	if service.schedule.interval > 0 {
+		// Advance on the original cadence, coalescing missed ticks without a backlog.
+		remaining := service.schedule.interval - now.Sub(service.nextRun)%service.schedule.interval
+		service.nextRun = now.Add(remaining)
+	} else {
+		service.nextRun = service.schedule.next(now)
+		if !service.schedule.matches(now) {
+			return
+		}
+	}
+	count := 0
+	for child := range manager.workers {
+		if child.service.name == service.name {
+			count++ // Includes reservations, draining processes and awaited post-stop hooks.
+		}
+	}
+	limit := 1
+	if service.config.Overlap {
+		limit = service.config.MaxWorkers
+	}
+	if service.scheduled || count >= limit {
+		manager.log.Debug("scheduled execution skipped", "app", service.name, "executions", count)
+		return
+	}
+	service.scheduled = true
+	manager.log.Info("scheduled execution due", "app", service.name)
+}
+
 // Load validates the whole snapshot before it can replace running services.
 // Relative paths resolve against the YAML file that contains them.
 func Load(path string) (Snapshot, error) {
@@ -974,6 +1142,9 @@ func validateDependencies(apps map[string]App) error {
 		}
 		state[name] = 1
 		for dependency := range app.dependencies() {
+			if apps[dependency].Schedule != "" {
+				return fmt.Errorf("%s: scheduled app %q cannot be a service dependency", name, dependency)
+			}
 			if err := visit(dependency); err != nil {
 				return err
 			}
@@ -990,6 +1161,18 @@ func validateDependencies(apps map[string]App) error {
 }
 
 func (app App) validate() error {
+	if _, err := parseSchedule(app.Schedule); err != nil {
+		return fmt.Errorf("schedule: %w", err)
+	}
+	if app.Schedule != "" && (app.Listen.Network != "" || app.Startup || app.MinWorkers != 0) {
+		return fmt.Errorf("schedule requires no listen, startup: false and min_workers: 0")
+	}
+	if app.Overlap && app.Schedule == "" {
+		return fmt.Errorf("overlap requires schedule")
+	}
+	if app.MaxExecTime < 0 {
+		return fmt.Errorf("max_exec_time must be non-negative; zero disables the limit")
+	}
 	if app.SocketMode != nil && (runtime.GOOS != "linux" || app.Listen.Network != "unix" || *app.SocketMode > 0777) {
 		return fmt.Errorf("socket_mode requires a Linux Unix socket and permissions between 0000 and 0777")
 	}
@@ -1823,6 +2006,7 @@ type process struct {
 	telemetry bool
 	active    map[string]time.Time
 	started   time.Time
+	executed  time.Time
 	idleSince time.Time
 	stopping  time.Time
 	killed    bool
@@ -1849,7 +2033,7 @@ type message struct {
 
 func (manager *manager) spawn(service *service, now time.Time) error {
 	cycle := service.cycle
-	if cycle == nil || cycle.retiring {
+	if cycle == nil || cycle.retiring || service.config.Schedule != "" {
 		cycle = &appCycle{members: make(map[*process]struct{})}
 		cycle.scope = &actionScope{config: service.config, address: service.address(), cycle: cycle, runs: make(map[string][]*actionRun)}
 		service.cycle = cycle
@@ -1959,6 +2143,7 @@ func (manager *manager) startProcess(child *process, now time.Time) error {
 	cmd = job.cmd
 	child.pid, child.cmd, child.control, child.job = cmd.Process.Pid, cmd, control, job
 	child.pending = false
+	child.executed = time.Now()
 	control = nil
 	if app.Ready == "started" {
 		child.baseReady = true
@@ -2035,6 +2220,9 @@ func (listener *serviceListener) arm(operation int) error {
 }
 
 type service struct {
+	schedule      schedule
+	nextRun       time.Time
+	scheduled     bool
 	cycle         *appCycle
 	name          string
 	config        App
@@ -2248,6 +2436,14 @@ func (manager *manager) apply(snapshot Snapshot) error {
 	if snapshot.Cgroup != manager.cgroup {
 		return fmt.Errorf("changing cgroup requires restarting ooth")
 	}
+	plans := make(map[string]schedule)
+	for name, app := range snapshot.Apps {
+		plan, err := parseSchedule(app.Schedule)
+		if err != nil {
+			return fmt.Errorf("%s: schedule: %w", name, err)
+		}
+		plans[name] = plan
+	}
 	opened := make(map[string]*serviceListener)
 	var permissions []func(bool) error
 	committed := false
@@ -2330,7 +2526,8 @@ func (manager *manager) apply(snapshot Snapshot) error {
 		if previous != nil {
 			listener = previous.listener
 		}
-		current := &service{name: name, config: app, listener: listener, workers: make(map[*process]struct{})}
+		current := &service{name: name, config: app, listener: listener, workers: make(map[*process]struct{}), schedule: plans[name]}
+		current.nextRun = current.schedule.next(time.Now())
 		// Retain draining workers for cleanup, separately from active capacity.
 		if previous != nil {
 			for child := range previous.workers {
@@ -2413,7 +2610,7 @@ func (manager *manager) stop(child *process, now time.Time, reason string) {
 			child.cycle.scope.cancelChecks()
 		}
 	}
-	if child.failed {
+	if child.failed && child.config.Schedule == "" {
 		// Replacements can start before this process exits; throttle failures now.
 		child.service.demand = true
 		child.service.backoff(now)
@@ -2483,7 +2680,7 @@ func (manager *manager) handle(msg message, now time.Time) {
 			child.exitCode = child.cmd.ProcessState.ExitCode()
 		}
 		manager.log.Info("worker exited", "app", service.name, "pid", child.pid, "error", msg.err)
-		if child.stopping.IsZero() {
+		if child.stopping.IsZero() && child.config.Schedule == "" {
 			service.demand = true
 			service.backoff(now)
 		}
@@ -2599,6 +2796,11 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 			}
 			continue
 		}
+		if app.MaxExecTime > 0 && !child.executed.IsZero() && now.Sub(child.executed) >= app.MaxExecTime {
+			child.failed = true
+			manager.stop(child, now, "maximum execution time")
+			continue
+		}
 		if !child.wasReady && !child.ready && now.Sub(child.started) >= app.StartTimeout {
 			child.failed = true
 			manager.stop(child, now, "startup timeout")
@@ -2673,6 +2875,13 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 		}
 	}
 	for name, current := range manager.services {
+		if current.config.Schedule != "" {
+			manager.scheduleDue(current, now)
+			if current.scheduled || len(current.workers) > 0 {
+				activate(name)
+			}
+			continue
+		}
 		if current.config.Startup || current.config.MinWorkers > 0 || current.demand || (current.listener != nil && len(current.workers) > 0) {
 			activate(name)
 		}
@@ -2680,7 +2889,7 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 	for _, service := range manager.services {
 		app := service.config
 		if !manager.dependenciesReady(app, false) {
-			if len(service.workers) > 0 {
+			if len(service.workers) > 0 && app.Schedule == "" {
 				service.demand = true
 			}
 			for child := range service.workers {
@@ -2703,6 +2912,15 @@ func (manager *manager) tick(now time.Time, stopping bool) {
 					manager.lifecycle(child, now)
 				}
 			}
+		}
+		if app.Schedule != "" {
+			if service.scheduled {
+				service.scheduled = false
+				if err := manager.spawn(service, now); err != nil {
+					manager.log.Error("scheduled execution start failed", "app", service.name, "error", err)
+				}
+			}
+			continue
 		}
 		service.observePressure(now)
 		pressureGrowth := service.pressure.evaluate(now, app.ScaleWindow, app.ScaleAt)
